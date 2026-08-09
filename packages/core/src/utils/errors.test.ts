@@ -7,7 +7,13 @@
 import { describe, it, expect } from 'vitest';
 import { APIUserAbortError as AnthropicAPIUserAbortError } from '@anthropic-ai/sdk';
 import { APIConnectionError, APIUserAbortError } from 'openai';
-import { getErrorMessage, isAbortError, isNodeError } from './errors.js';
+import {
+  getErrorMessage,
+  isAbortError,
+  isNodeError,
+  isUserCancel,
+  USER_CANCEL_ABORT_REASON,
+} from './errors.js';
 
 describe('getErrorMessage cause unwrapping', () => {
   it('returns the plain message when there is no cause', () => {
@@ -270,6 +276,62 @@ describe('isAbortError', () => {
 
     expect(error.constructor.name).toBe('APIConnectionError');
     expect(isAbortError(error)).toBe(false);
+  });
+});
+
+describe('isUserCancel', () => {
+  const abortShaped = () =>
+    new APIUserAbortError({ message: 'Request was aborted.' });
+
+  it('is true for an abort-shaped error tagged with the user-cancel reason', () => {
+    const controller = new AbortController();
+    controller.abort(USER_CANCEL_ABORT_REASON);
+
+    expect(isUserCancel(abortShaped(), controller.signal)).toBe(true);
+  });
+
+  it('is false for a bare abort — the default is to report, not suppress', () => {
+    // The polarity that matters: an untagged abort (e.g. an internal deadline
+    // that reused this signal, or a producer that forgot to tag) is reported,
+    // not silently swallowed as a cancel.
+    const controller = new AbortController();
+    controller.abort();
+
+    expect(isUserCancel(abortShaped(), controller.signal)).toBe(false);
+  });
+
+  it('is false for a timeout-shaped abort reason', () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException('deadline', 'TimeoutError'));
+
+    expect(isUserCancel(abortShaped(), controller.signal)).toBe(false);
+  });
+
+  it('is false for a different string reason', () => {
+    const controller = new AbortController();
+    controller.abort('qwen:session-dispose');
+
+    expect(isUserCancel(abortShaped(), controller.signal)).toBe(false);
+  });
+
+  it('is false when the signal never aborted', () => {
+    const controller = new AbortController();
+
+    expect(isUserCancel(abortShaped(), controller.signal)).toBe(false);
+  });
+
+  it('is false when there is no signal', () => {
+    expect(isUserCancel(abortShaped(), undefined)).toBe(false);
+  });
+
+  it('is false for a non-abort error even on a user-cancel-tagged signal', () => {
+    // A genuine failure that races a user cancel is still a failure.
+    const controller = new AbortController();
+    controller.abort(USER_CANCEL_ABORT_REASON);
+
+    expect(isUserCancel(new Error('rate limited'), controller.signal)).toBe(
+      false,
+    );
   });
 });
 

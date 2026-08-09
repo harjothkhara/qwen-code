@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { USER_CANCEL_ABORT_REASON } from '../../utils/errors.js';
 import type {
   GenerateContentParameters,
   GenerateContentResponseUsageMetadata,
@@ -785,7 +786,7 @@ describe('LoggingContentGenerator', () => {
       enableOpenAILogging: false,
     });
     const controller = new AbortController();
-    controller.abort();
+    controller.abort(USER_CANCEL_ABORT_REASON);
     const request = {
       model: 'test-model',
       contents: 'Hello',
@@ -883,6 +884,41 @@ describe('LoggingContentGenerator', () => {
     expect(logApiError).toHaveBeenCalledTimes(1);
   });
 
+  it('emits an api_error event when an internal deadline aborts the request', async () => {
+    // The headline of positive-only polarity: an internal deadline aborts the
+    // same request signal and the SDK rejects abort-shaped, exactly like a user
+    // cancel — but the abort is not tagged as a user cancel, so it is reported
+    // rather than silently suppressed. Under the old "suppress unless
+    // TimeoutError" gate this required the deadline to opt in; here the default
+    // is safe.
+    const wrapped = createWrappedGenerator(
+      vi
+        .fn()
+        .mockRejectedValue(
+          new APIUserAbortError({ message: 'Request was aborted.' }),
+        ),
+      vi.fn(),
+    );
+    const generator = new LoggingContentGenerator(wrapped, createConfig(), {
+      model: 'test-model',
+      authType: AuthType.USE_OPENAI,
+      enableOpenAILogging: false,
+    });
+    const controller = new AbortController();
+    controller.abort(new DOMException('deadline exceeded', 'TimeoutError'));
+    const request = {
+      model: 'test-model',
+      contents: 'Hello',
+      config: { abortSignal: controller.signal },
+    } as unknown as GenerateContentParameters;
+
+    await expect(
+      generator.generateContent(request, 'prompt-deadline'),
+    ).rejects.toBeInstanceOf(APIUserAbortError);
+
+    expect(logApiError).toHaveBeenCalledTimes(1);
+  });
+
   it('still emits an api_error event for an abort-shaped error when the request has no signal', async () => {
     // The remaining truth-table cell: no `config.abortSignal` at all. Nobody
     // could have cancelled, so an abort-shaped rejection here is a real
@@ -921,7 +957,7 @@ describe('LoggingContentGenerator', () => {
     // APIUserAbortError is the shape that genuinely arrives here. Dropping the
     // signal argument at this site would re-emit the #8356 noise.
     const controller = new AbortController();
-    controller.abort();
+    controller.abort(USER_CANCEL_ABORT_REASON);
     const wrapped = createWrappedGenerator(
       vi.fn(),
       vi
@@ -960,7 +996,7 @@ describe('LoggingContentGenerator', () => {
     const streamFn = vi.fn().mockResolvedValue(
       (async function* () {
         yield createResponse('resp-1', 'test-model', [{ text: 'partial' }]);
-        controller.abort();
+        controller.abort(USER_CANCEL_ABORT_REASON);
         throw new APIUserAbortError({ message: 'Request was aborted.' });
       })(),
     );
@@ -1003,7 +1039,7 @@ describe('LoggingContentGenerator', () => {
     const streamFn = vi.fn().mockResolvedValue(
       (async function* () {
         yield createResponse('resp-1', 'test-model', [{ text: 'partial' }]);
-        controller.abort();
+        controller.abort(USER_CANCEL_ABORT_REASON);
         throw new DOMException('The operation was aborted.', 'AbortError');
       })(),
     );

@@ -14,7 +14,7 @@ import { ContentGenerationPipeline } from './pipeline.js';
 import { EnhancedErrorHandler } from './errorHandler.js';
 import { RequestTokenEstimator } from '../../utils/request-tokenizer/index.js';
 import type { ContentGeneratorConfig } from '../contentGenerator.js';
-import { isAbortError } from '../../utils/errors.js';
+import { isUserCancel } from '../../utils/errors.js';
 import { createDebugLogger } from '../../utils/debugLogger.js';
 import { redactProxyError } from '../../utils/runtimeFetchOptions.js';
 
@@ -52,18 +52,12 @@ export class OpenAIContentGenerator implements ContentGenerator {
     error: unknown,
     request: GenerateContentParameters,
   ): boolean {
-    // Only suppress error logging for user-initiated cancellations.
-    // We check that BOTH:
-    // 1. The error is an AbortError
-    // 2. AND our abort signal was explicitly aborted (user-initiated)
-    //
-    // This ensures we don't suppress network-related abort errors that
-    // the user should be aware of.
-    if (isAbortError(error) && request.config?.abortSignal?.aborted) {
-      return true;
-    }
-
-    return false;
+    // Only suppress logging for a deliberate user cancel — an abort-shaped
+    // error on a signal tagged `USER_CANCEL_ABORT_REASON`. Shared with the
+    // api_error telemetry gate so the two logging paths agree, and so an
+    // internal deadline aborting this request stays logged rather than being
+    // mistaken for a cancel.
+    return isUserCancel(error, request.config?.abortSignal);
   }
 
   async generateContent(

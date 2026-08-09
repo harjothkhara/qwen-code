@@ -50,6 +50,7 @@ import {
   AuthType,
   ApprovalMode,
   CompressionStatus,
+  USER_CANCEL_ABORT_REASON,
   detectLoopSentinel,
   detectAutonomousSentinel,
   LoopTickResolver,
@@ -313,7 +314,8 @@ const permissionRequestTails = new WeakMap<
   AgentSideConnection,
   Promise<void>
 >();
-const USER_CANCEL_ABORT_REASON = 'qwen:user-cancel';
+// `USER_CANCEL_ABORT_REASON` is imported from core so the same tag that the
+// telemetry gate keys on is the one this session stamps on a cancel.
 const SESSION_DISPOSE_ABORT_REASON = 'qwen:session-dispose';
 const DAEMON_RETRY_META_KEY = 'qwen.daemon.retry';
 const DAEMON_CONTINUE_META_KEY = 'qwen.daemon.continueLastTurn';

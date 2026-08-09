@@ -14,6 +14,7 @@ import {
 } from 'react';
 import {
   runOutsideAgentContext,
+  USER_CANCEL_ABORT_REASON,
   type Config,
   type EditorType,
   type GeminiClient,
@@ -1052,7 +1053,9 @@ export const useGeminiStream = (
     turnCancelledRef.current = true;
     submissionLeaseGenerationRef.current += 1;
     setSubmissionInFlight(false);
-    abortControllerRef.current?.abort();
+    // Tag the abort so downstream telemetry can tell this deliberate user
+    // cancel apart from an internal deadline aborting the same request.
+    abortControllerRef.current?.abort(USER_CANCEL_ABORT_REASON);
     // Aborting a tick-in-flight ends any self-paced /loop: drop pending loop
     // wakeups so the loop doesn't resume after the cancelled tick. Only clears
     // session wakeups (never cron jobs); lazily-creating an empty scheduler

@@ -58,6 +58,37 @@ export function isAbortError(error: unknown): boolean {
 }
 
 /**
+ * The abort reason a deliberate user cancel carries. A user cancel and an
+ * internal deadline both abort the same request signal and both reject
+ * abort-shaped, so they cannot be told apart at the error — only at the reason
+ * the aborting side sets. User-cancel producers (the TUI turn cancel, the
+ * ACP/daemon session) tag their abort with this; deadlines, budgets and
+ * watchdogs do not.
+ */
+export const USER_CANCEL_ABORT_REASON = 'qwen:user-cancel';
+
+/**
+ * Whether an error is a deliberate user cancel: an abort-shaped error on a
+ * signal the caller aborted with `USER_CANCEL_ABORT_REASON`. Callers that
+ * suppress reporting for user cancels gate on this instead of a bare
+ * `signal.aborted && isAbortError(error)`.
+ *
+ * The default is to REPORT. Only an abort explicitly tagged as a user cancel is
+ * treated as one, so a new internal deadline that forgets to tag itself
+ * surfaces as a (recoverable) `api_error` rather than a silent telemetry hole.
+ * That is the opposite polarity to gating on "not a TimeoutError": the
+ * user-cancel producer set is small and closed, the deadline set is open and
+ * growing, so the safe default is the closed set having to opt in.
+ */
+export function isUserCancel(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    signal?.aborted === true &&
+    signal.reason === USER_CANCEL_ABORT_REASON &&
+    isAbortError(error)
+  );
+}
+
+/**
  * Best-effort one-line description of an error's `cause`, used to surface the
  * underlying syscall behind opaque wrappers like undici's `TypeError: fetch
  * failed` (whose own message carries nothing). Returns `undefined` when there

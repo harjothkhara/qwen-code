@@ -27,6 +27,7 @@ vi.mock('../../../utils/request-tokenizer/index.js', () => ({
 
 // Now import the modules that depend on the mocked modules
 import { OpenAIContentGenerator } from './openaiContentGenerator.js';
+import { USER_CANCEL_ABORT_REASON } from '../../utils/errors.js';
 import type { Config } from '../../config/config.js';
 import { AuthType } from '../contentGenerator.js';
 import type {
@@ -253,9 +254,9 @@ describe('OpenAIContentGenerator (Refactored)', () => {
       expect(result).toBe(false);
     });
 
-    it('should return true for AbortError when signal is also aborted (user cancellation)', () => {
+    it('should return true for AbortError when signal is aborted with the user-cancel reason', () => {
       const abortController = new AbortController();
-      abortController.abort();
+      abortController.abort(USER_CANCEL_ABORT_REASON);
 
       const request: GenerateContentParameters = {
         contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
@@ -265,7 +266,7 @@ describe('OpenAIContentGenerator (Refactored)', () => {
         },
       };
 
-      // Create an AbortError with aborted signal - this is user-initiated
+      // Create an AbortError on a signal tagged as a user cancel.
       const abortError = new Error('The operation was aborted');
       abortError.name = 'AbortError';
 
