@@ -734,7 +734,7 @@ export class AgentTool extends BaseDeclarativeTool<AgentParams, ToolResult> {
           type: 'boolean',
           default: true,
           description:
-            'Defaults to true for top-level regular subagents. Set to false to run a regular agent in the foreground and return its result inline. Set to true for an interactive fork to receive its completion notification; headless forks always run in the background. Nested agents run in the foreground unless run_in_background is explicitly true, which is rejected because they cannot receive background completion notifications. Unnamed caller-owned working_dir launches default to foreground. Named teammates may run in the background, but must be shut down before their caller-owned worktree is removed.',
+            'Defaults to true for top-level regular subagents. Set to false to run a regular agent in the foreground and return its result inline. Set to true for an interactive fork to receive its completion notification; headless forks always run in the background. Nested agents run in the foreground unless run_in_background is explicitly true, which is rejected because they cannot receive background completion notifications. Unnamed caller-owned working_dir launches default to foreground. Named teammates always run concurrently — omit this parameter when spawning one (run_in_background: false is rejected; omit "name" instead for an inline result) — and must be shut down before their caller-owned worktree is removed.',
         },
         ...(config.isAgentTeamEnabled()
           ? {
@@ -856,7 +856,7 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user asks for agents "in parallel", group independent launches in a single message with multiple Agent tool use content blocks. Do not parallelize overlapping code changes.
-- Top-level regular subagents run in the background by default. Set \`run_in_background: false\` when the current turn must wait for the result before continuing. Nested agent launches run in the foreground and return to their direct parent; an explicit \`run_in_background: true\` request is rejected because nested agents cannot receive background completion notifications. Unnamed caller-owned \`working_dir\` launches default to foreground and cannot run in the background; named teammates may use one, but must be shut down before it is removed.
+- Top-level regular subagents run in the background by default. Set \`run_in_background: false\` when the current turn must wait for the result before continuing. Nested agent launches run in the foreground and return to their direct parent; an explicit \`run_in_background: true\` request is rejected because nested agents cannot receive background completion notifications. Unnamed caller-owned \`working_dir\` launches default to foreground and cannot run in the background; named teammates may use one, but must be shut down before it is removed. Named teammates always run concurrently — omit \`run_in_background\` when spawning one (\`run_in_background: false\` is rejected); omit \`name\` instead when you need the result inline.
 - You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result so you can review or merge them.
 ## When to fork
 
@@ -1031,6 +1031,21 @@ assistant: Uses the ${ToolNames.AGENT} tool to launch the test-runner agent
           ...availableGrades.keys(),
         ].join(', ')}.`;
       }
+    }
+
+    // Named teammates are inherently concurrent: they have persistent
+    // identity, messaging, and a team-managed lifecycle, none of which fit
+    // inline (blocking) semantics. Reject the contradictory request up front
+    // so no teammate is spawned and no tokens are spent on a call whose
+    // blocking expectation cannot be honored.
+    if (
+      params.run_in_background === false &&
+      params.name &&
+      !isTeammate() &&
+      isTopLevelSession() &&
+      this.config.getTeamManager()
+    ) {
+      return 'Parameter "run_in_background" cannot be false for a named teammate: teammates always run concurrently. Omit "run_in_background", or omit "name" to run a regular subagent inline.';
     }
 
     // Some models emit an empty placeholder for the unused optional field.
@@ -2264,6 +2279,15 @@ class AgentToolInvocation extends BaseToolInvocation<AgentParams, ToolResult> {
         return this.buildSpawnBlockedResult(
           'Error: "isolation" cannot be used for a named teammate. Create a leader-owned worktree first, then pass it with "working_dir".',
           'isolation is incompatible with a named teammate',
+        );
+      } else if (this.params.run_in_background === false) {
+        // Runtime backstop for the validateToolParams rejection: a team can
+        // become active after validation ran. Blocking here keeps the
+        // guarantee that a contradictory call never spawns a teammate or
+        // spends tokens on work its caller expected to block on.
+        return this.buildSpawnBlockedResult(
+          'Error: run_in_background: false is not supported for a named teammate — teammates always run concurrently. Omit "run_in_background", or omit "name" to run a regular subagent inline.',
+          'run_in_background: false is incompatible with a named teammate',
         );
       } else {
         return this.executeTeammate(this.params.name, signal, updateOutput);

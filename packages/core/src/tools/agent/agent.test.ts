@@ -819,6 +819,34 @@ describe('AgentTool', () => {
       ).toMatch(/not supported for a named teammate/i);
     });
 
+    it('rejects run_in_background: false for named teammates', () => {
+      // #9430: teammates are inherently concurrent; a blocking request must
+      // fail before any teammate spawns or tokens are spent.
+      vi.mocked(config.getTeamManager).mockReturnValue({
+        spawnTeammate: vi.fn(),
+      } as never);
+
+      expect(
+        agentTool.validateToolParams({
+          ...validParams,
+          name: 'helper',
+          run_in_background: false,
+        }),
+      ).toMatch(/cannot be false for a named teammate/i);
+    });
+
+    it('accepts run_in_background: false with a name when no team is active', () => {
+      // Without a team, `name` falls through to a regular one-shot agent,
+      // where a foreground run is the normal inline path.
+      expect(
+        agentTool.validateToolParams({
+          ...validParams,
+          name: 'helper',
+          run_in_background: false,
+        }),
+      ).toBeNull();
+    });
+
     it.each(['all', '1', '12'] as const)(
       'accepts fork_turns=%s for fork agents',
       (forkTurns) => {
@@ -1571,6 +1599,29 @@ describe('AgentTool', () => {
 
       expect(partToString(result.llmContent)).toMatch(
         /not supported for a named teammate/i,
+      );
+      expect(spawnTeammate).not.toHaveBeenCalled();
+    });
+
+    it('blocks run_in_background: false if a team becomes active after validation', async () => {
+      const spawnTeammate = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(config.getTeamManager).mockReturnValue({
+        spawnTeammate,
+      } as never);
+
+      const invocation = (
+        agentTool as AgentToolWithProtectedMethods
+      ).createInvocation({
+        description: 'Search files',
+        prompt: 'Find the config',
+        subagent_type: 'file-search',
+        name: 'searcher',
+        run_in_background: false,
+      });
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(partToString(result.llmContent)).toMatch(
+        /run_in_background: false is not supported for a named teammate/i,
       );
       expect(spawnTeammate).not.toHaveBeenCalled();
     });
