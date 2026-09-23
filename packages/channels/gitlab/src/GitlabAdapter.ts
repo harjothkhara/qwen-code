@@ -99,6 +99,13 @@ export class GitlabChannel extends PollingChannelBase<GitlabCursor> {
     );
     this.config.allowedUsers = allowed;
     this.gate.replaceAllowedUsers(allowed);
+    if (this.config.allowedGroupUsers) {
+      const allowedGroup = this.config.allowedGroupUsers.map((u) =>
+        u.toLowerCase(),
+      );
+      this.config.allowedGroupUsers = allowedGroup;
+      this.groupSenderGate?.replaceAllowedUsers(allowedGroup);
+    }
 
     this.startPollLoop();
   }
@@ -353,12 +360,6 @@ export class GitlabChannel extends PollingChannelBase<GitlabCursor> {
       ),
       true,
     );
-    const isMentionTrigger =
-      todo.action_name === 'mentioned' ||
-      todo.action_name === 'directly_addressed';
-    if (!isNoteMention && !isMentionTrigger) {
-      envelope.bypassMessagePrefix = true;
-    }
 
     if (isNoteMention) {
       this.reactions.set(messageId, {

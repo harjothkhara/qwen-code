@@ -27,9 +27,6 @@ import {
   PollingChannelBase,
   sanitizeDisplayText,
   sanitizeLogText,
-  sanitizePromptText,
-  stripMessagePrefix,
-  truncateCodePoints,
 } from '@qwen-code/channel-base';
 import { testBotMention, stripBotMention } from './mention.js';
 
@@ -386,8 +383,6 @@ function isInboundEnvelope(value: unknown): value is Envelope | undefined {
       Array.isArray(envelope.attachments)) &&
     (envelope.metadata === undefined ||
       typeof envelope.metadata === 'string') &&
-    (envelope.bypassMessagePrefix === undefined ||
-      envelope.bypassMessagePrefix === true) &&
     (envelope.alreadyPrefixed === undefined ||
       envelope.alreadyPrefixed === true)
   );
@@ -526,7 +521,6 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
     bridge: ChannelAgentBridge,
     options?: ChannelBaseOptions,
   ) {
-    config.blockStreaming = 'off';
     config.instructions = [
       config.instructions?.trim(),
       GITHUB_PUBLICATION_INSTRUCTIONS,
@@ -628,6 +622,14 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
       );
     }
     this.gate.replaceAllowedUsers(allowed);
+    // The decoupled group axis is matched against the same lowercased login.
+    if (this.config.allowedGroupUsers) {
+      const allowedGroup = this.config.allowedGroupUsers.map((u) =>
+        u.toLowerCase(),
+      );
+      this.config.allowedGroupUsers = allowedGroup;
+      this.groupSenderGate?.replaceAllowedUsers(allowedGroup);
+    }
     this.migrateLegacyPublicationState();
     this.inboundPersistenceBlocked = false;
     this.inboundRecoveryPending = true;
@@ -1357,7 +1359,7 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
       // Approved paired groups bypass the sender gate in preflight, so the
       // directed lane must mirror that or follow-ups fail mention gating.
       const allowed =
-        this.gate.isAllowed(senderId) ||
+        this.senderGateFor(true).isAllowed(senderId) ||
         (directed &&
           this.config.groupPolicy === 'pairing' &&
           this.groupGate.isGroupApproved(ctx.chatId));
@@ -1423,7 +1425,6 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
         ? await this.fetchPrMeta(ctx)
         : await this.fetchIssueMeta(ctx);
     const title = meta.title || ctx.subjectTitle;
-    const displayTitle = truncateCodePoints(sanitizePromptText(title), 500);
     const details =
       reason === 'review_requested'
         ? `Author: ${meta.user?.login || 'unknown'} | State: ${meta.state || 'unknown'} | Draft: ${meta.draft ? 'true' : 'false'} | Branch: ${meta.head?.ref || 'unknown'} → ${meta.base?.ref || 'unknown'}`
@@ -1441,11 +1442,6 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
         reason === 'review_requested'
           ? 'Return a formal review summary with verified actionable findings, or a concise no-blocker result.'
           : 'Triage this issue and respond with the next action.',
-      displayText:
-        reason === 'review_requested'
-          ? `Review requested: ${displayTitle}`
-          : `Issue assigned: ${displayTitle}`,
-      bypassMessagePrefix: true,
       isGroup: true,
       isMentioned: true,
       isReplyToBot: false,
@@ -1470,26 +1466,14 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
       const sender = (comment.user?.login || 'unknown').toLowerCase();
       return (
         !this.cursor.dispatchedComments?.includes(key) &&
-        this.gate.isAllowed(sender)
+        this.senderGateFor(true).isAllowed(sender)
       );
     });
     for (const comment of newComments) {
       this.recordDispatchedComment(comment.node_id || String(comment.id));
     }
-    const messagePrefix = this.configuredMessagePrefix();
     const comments = newComments
-      .flatMap((comment) => {
-        const rawBody = comment.body || '';
-        const body = messagePrefix
-          ? stripMessagePrefix(
-              this.botUsername
-                ? stripBotMention(rawBody, this.botUsername)
-                : rawBody,
-              messagePrefix,
-            )
-          : rawBody.trim();
-        return body === undefined ? [] : [{ comment, body }];
-      })
+      .map((comment) => ({ comment, body: (comment.body || '').trim() }))
       .slice(-MAX_AGGREGATE_COMMENTS);
     if (comments.length === 0) return;
 
@@ -1508,8 +1492,6 @@ export class GithubChannel extends PollingChannelBase<GithubCursor> {
       threadId: ctx.threadId,
       messageId: String(first.id),
       text: `Review these new comments and output exactly ${NO_REPLY_SENTINEL} if no public reply is needed:\n${summary}`,
-      displayText: summary,
-      bypassMessagePrefix: true,
       isGroup: true,
       isMentioned: true,
       isReplyToBot: false,

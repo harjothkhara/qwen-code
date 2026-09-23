@@ -46,7 +46,6 @@ Add the channel to `~/.qwen/settings.json`:
       "allowedUsers": ["operator-github-username"],
       "sessionScope": "chat_thread",
       "cwd": "/path/to/your/project",
-      "blockStreaming": "off",
       "groupPolicy": "open",
       "groups": {
         "*": { "requireMention": true }
@@ -87,7 +86,6 @@ Local `gh` authentication requires an HTTPS `baseUrl` so the daemon host credent
 | `groupPolicy`             | `"disabled"`             | Must be `"open"`, `"allowlist"` with the repo (`owner/repo`) listed in `groups`, or `"pairing"` with the repo approved for notifications to flow |
 | `senderPolicy`            | `"allowlist"`            | Who can trigger the bot                                                                                                                          |
 | `groups.*.requireMention` | `true`                   | Require @mentions for ordinary comments; directed notification reasons still run                                                                 |
-| `blockStreaming`          | `"off"`                  | Always forced to `"off"`; intermediate model chunks aren't published; `"on"` is not supported                                                    |
 | `reasonFilter`            | unset                    | Optional allowlist of GitHub notification reasons to process                                                                                     |
 
 Use `reasonFilter` to drop noisy notification classes such as `ci_activity` or `state_change`. Do not use `reasonFilter: ["mention"]` as a replacement for `groups.*.requireMention`: GitHub's `mention` reason is sticky at the thread level, so real new @mentions can arrive later under `comment`, `subscribed`, `author`, or other reasons and would be skipped.
@@ -101,6 +99,8 @@ Filtered notifications are marked read only after all accepted work in the poll 
 On a **public repository**, setting `senderPolicy: "open"` allows **any GitHub user** who triggers a supported notification reason to submit prompts that drive the agent in your `cwd`. This includes reading code, spending tokens, posting comments, and (subject to permission policy) running tools.
 
 Always use `senderPolicy: "allowlist"` with explicit `allowedUsers` on public repos.
+
+All GitHub traffic is group traffic, so on this channel `groupSenderPolicy` replaces `senderPolicy` for every sender check: `groupSenderPolicy: "open"` is equivalent to `senderPolicy: "open"` and admits any commenter on a watched thread, mentioned or not. Keep it `inherit` (or `allowlist` with explicit `allowedGroupUsers`) on public repos.
 
 Allowlist and pairing entries follow the **username**, not the immutable account ID. If an allowlisted user renames their GitHub account, remove the stale entry — GitHub releases the old username for anyone else to claim, and the new holder would inherit the allowlist/pairing authorization.
 
@@ -133,13 +133,7 @@ For an accepted issue or pull-request comment, the channel adds GitHub's `👀` 
 
 ### Final-only output
 
-The GitHub channel always forces final-only delivery. The adapter sets `blockStreaming` to `"off"`, so intermediate model chunks are never published as separate comments and `blockStreaming: "on"` is not supported.
-
-```json
-{
-  "blockStreaming": "off"
-}
-```
+The GitHub channel publishes only completed responses. Intermediate model chunks are never published as separate comments.
 
 If GitHub returns a definite no-write delivery failure, such as a rate-limit
 response, the channel stores the final reply in
