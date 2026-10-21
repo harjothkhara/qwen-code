@@ -25,11 +25,9 @@
  */
 
 import type { ReactNode } from 'react';
-import {
-  createDebugLogger,
-  type Config,
-  type Logger,
-} from '@qwen-code/qwen-code-core';
+import type { Config } from '@qwen-code/qwen-code-core/config/config.js';
+import type { Logger } from '@qwen-code/qwen-code-core/core/logger.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
 import {
   type ConfirmationRequest,
   type HistoryItem,
@@ -361,9 +359,13 @@ export class OpenTuiAppHost implements OpenTuiCommandHost, SessionSwitchHost {
 
   // --- idle / processing --------------------------------------------------
 
-  /** Parity of `isIdleRef.current`: no dispatched command, no live turn. */
+  /** No command dispatch or model turn in flight; sampled before dispatch. */
   isIdle(): boolean {
     return !this.processing && !this.streaming;
+  }
+
+  isStreaming(): boolean {
+    return this.streaming;
   }
 
   setIsProcessing(processing: boolean): void {

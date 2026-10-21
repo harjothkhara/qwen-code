@@ -17,6 +17,7 @@
 import type {
   ServeWorkspaceMcpStatus,
   ServeWorkspaceSkillsStatus,
+  ServeWorkspaceSkillsRefreshResult,
   ServeWorkspaceProvidersStatus,
   ServeWorkspaceExtensionsStatus,
   ServeWorkspaceHooksStatus,
@@ -24,6 +25,7 @@ import type {
   ServeWorkspacePreflightStatus,
   DaemonStatusProvider,
 } from '@qwen-code/acp-bridge';
+import type { SkillToggleBlock } from '../../config/skill-settings.js';
 import type { WorkspaceTrustStatus } from '../../config/trustedFolders.js';
 import type {
   PermissionRuleType,
@@ -103,7 +105,9 @@ export type InvokeWorkspaceCommandFn = <T>(
   opts?: { timeoutMs?: number },
 ) => Promise<T>;
 
-export type RefreshExtensionsForAllSessionsFn = () => Promise<{
+export type RefreshExtensionsForAllSessionsFn = (
+  sessionIds?: readonly string[],
+) => Promise<{
   refreshed: number;
   failed: number;
 }>;
@@ -195,6 +199,18 @@ export interface DaemonWorkspaceService {
     request: WorkspaceTrustChangeRequest,
   ): Promise<WorkspaceTrustChangeResult>;
 
+  /**
+   * Record the bound workspace as trusted in the local trusted-folders file.
+   *
+   * `requestWorkspaceTrustChange` only publishes an operator prompt; this
+   * writes the decision. The path is always the bound workspace, never
+   * caller-supplied, and the route reaching it sits behind the strict
+   * mutation gate, so the caller already holds operator authority.
+   */
+  grantWorkspaceTrust(
+    ctx: WorkspaceRequestContext,
+  ): Promise<WorkspaceTrustStatus>;
+
   /** Replace one permission rule list. */
   setWorkspacePermissionRules(
     ctx: WorkspaceRequestContext,
@@ -268,8 +284,13 @@ export interface DaemonWorkspaceService {
   /** Drop cached skill status so extension skill changes are re-enumerated. */
   invalidateWorkspaceSkillsStatus(): void;
 
-  /** Broadcast extension refresh to all active sessions (fire-and-forget). */
-  refreshExtensionsForAllSessions(): Promise<{
+  refreshWorkspaceSkills(
+    ctx: WorkspaceRequestContext,
+    sessionIds?: readonly string[],
+  ): Promise<ServeWorkspaceSkillsRefreshResult>;
+
+  /** Refresh selected sessions, or all active sessions when omitted. */
+  refreshExtensionsForAllSessions(sessionIds?: readonly string[]): Promise<{
     refreshed: number;
     failed: number;
   }>;
@@ -351,6 +372,23 @@ export class WorkspacePermissionRulesSessionRequiredError extends Error {
   }
 }
 
+/**
+ * A trust grant wrote its rule but the decision did not change: an
+ * equal-depth DO_NOT_TRUST rule under an alias spelling of the same
+ * directory, a settings error, or an IDE distrust of the daemon's own cwd
+ * wins over the new entry. The write is durably recorded; the failure is
+ * about the grant not taking effect, not about persistence.
+ */
+export class WorkspaceTrustGrantIneffectiveError extends Error {
+  constructor(state: string, source: string) {
+    super(
+      `Workspace trust grant did not take effect (state: ${state}, source: ${source}). ` +
+        'Check the workspace trust status and trust policy before retrying.',
+    );
+    this.name = 'WorkspaceTrustGrantIneffectiveError';
+  }
+}
+
 export interface WorkspaceVoiceSettingsUpdate {
   enabled?: boolean;
   mode?: VoiceMode;
@@ -368,6 +406,12 @@ export interface WorkspaceSkillToggleResult {
   skillName: string;
   enabled: boolean;
   changed: boolean;
+  /**
+   * The settings entry that forbids the toggle from taking effect, when the
+   * write was refused for one. A client that flips its row optimistically
+   * must read this or it shows an enable the config still denies.
+   */
+  block?: SkillToggleBlock;
   activation: WorkspaceSkillToggleActivation;
   sessionsRefreshed: number;
   sessionsFailed: number;
@@ -399,6 +443,8 @@ export interface WorkspaceSkillBatchToggleResult {
 export interface PersistDisabledSkillResult {
   changed: boolean;
   disabled: string[];
+  /** Set with `changed: false` when a standing entry refused the write. */
+  block?: SkillToggleBlock;
   settingsChanges?: Array<{
     key: 'skills.disabled' | 'skills.enabled';
     value: string[] | undefined;
@@ -509,9 +555,9 @@ export interface DaemonWorkspaceServiceDeps {
   workspaceSkillsStatusProvider?: WorkspaceSkillsStatusProvider;
 
   /**
-   * Returns whether the ACP channel is currently live. Used by
-   * `getWorkspaceEnvStatus` to populate the `acpChannelLive` field
-   * without requiring an ACP round-trip.
+   * Returns whether the workspace-control ACP channel (Legacy on a paired
+   * Bridge) is currently live. Used for preheat results, post-mutation
+   * refreshes and the `acpChannelLive` fields without an ACP round-trip.
    */
   isChannelLive?: () => boolean;
 

@@ -18,7 +18,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
-import type { Config } from '@qwen-code/qwen-code-core';
+import {
+  ToolConfirmationOutcome,
+  type Config,
+} from '@qwen-code/qwen-code-core';
+import type { LivePromptOptions, WaitingCallInfo } from './live-session.js';
 import {
   foldBatch,
   imagePathsToParts,
@@ -33,6 +37,11 @@ const live = vi.hoisted(() => ({
   turns: [] as Array<{ prompt: unknown; options: unknown }>,
   waiters: [] as Array<() => void>,
   declines: new Set<number>(),
+  signals: [] as AbortSignal[],
+  /** Events a 1-based turn yields ahead of the stub's bare `done`. */
+  script: new Map<number, Array<Record<string, unknown>>>(),
+  holds: new Set<number>(),
+  errors: new Map<number, Error>(),
 }));
 
 vi.mock('./live-session.js', () => ({
@@ -40,14 +49,18 @@ vi.mock('./live-session.js', () => ({
   async *livePromptEvents(
     _config: unknown,
     prompt: unknown,
-    _signal: unknown,
+    signal: AbortSignal,
     options: unknown,
   ) {
+    live.signals.push(signal);
     live.turns.push({ prompt, options });
-    if (live.turns.length === 1) {
+    const turn = live.turns.length;
+    if (turn === 1 || live.holds.has(turn)) {
       await new Promise<void>((resolve) => live.waiters.push(resolve));
     }
-    if (live.declines.has(live.turns.length)) return;
+    if (live.errors.has(turn)) throw live.errors.get(turn);
+    if (live.declines.has(turn)) return;
+    for (const event of live.script.get(turn) ?? []) yield event;
     yield { type: 'done' };
   },
 }));
@@ -113,6 +126,171 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     live.turns.length = 0;
     live.waiters.length = 0;
     live.declines.clear();
+    live.signals.length = 0;
+    live.script.clear();
+    live.holds.clear();
+    live.errors.clear();
+  });
+
+  function approval(title: string): WaitingCallInfo {
+    return {
+      callId: 'same-call',
+      name: 'read_file',
+      confirmationDetails: {
+        type: 'info',
+        title,
+        prompt: 'Continue?',
+        onConfirm: vi.fn(async () => {}),
+      },
+    };
+  }
+  function park(turn: number, call: WaitingCallInfo) {
+    (live.turns[turn - 1].options as LivePromptOptions).onWaitingCall?.(call);
+  }
+
+  it.each(['error', 'abort'])(
+    'clears terminal approval state without another key after %s',
+    async (kind) => {
+      const { result } = renderHook(() =>
+        useOpenTuiLiveTurn({ config: {} as Config }),
+      );
+      const call = approval('old');
+      const onComplete = vi.fn();
+      act(() => {
+        result.current.submit('first', undefined, { onComplete });
+        park(1, call);
+      });
+      expect(result.current.waitingCalls[0]).toBe(call);
+      expect(result.current.streaming).toBe(true);
+      if (kind === 'error')
+        live.errors.set(1, new DOMException('Owner revoked', 'AbortError'));
+      else act(() => result.current.interrupt());
+      await act(async () => live.waiters.shift()!());
+      await vi.waitFor(() => expect(result.current.streaming).toBe(false));
+      expect(result.current.waitingCalls).toEqual([]);
+      expect(call.confirmationDetails.onConfirm).not.toHaveBeenCalled();
+      expect(onComplete).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps a queued successor approval with the same callId', async () => {
+    live.holds.add(2);
+    live.errors.set(1, new Error('Owner revoked'));
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+    const old = approval('old');
+    const next = approval('next');
+    act(() => {
+      result.current.submit('first');
+      park(1, old);
+      result.current.submit('queued');
+    });
+    await act(async () => live.waiters.shift()!());
+    await vi.waitFor(() => expect(live.turns).toHaveLength(2));
+    act(() => park(2, next));
+    expect(result.current.waitingCalls).toEqual([next]);
+    expect(result.current.waitingCalls[0]).toBe(next);
+    expect(old.confirmationDetails.onConfirm).not.toHaveBeenCalled();
+    await act(async () => live.waiters.shift()!());
+  });
+
+  it('does not clear the new same-ID approval when a reset turn exits late', async () => {
+    live.holds.add(2);
+    live.errors.set(1, new Error('Old owner revoked'));
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+    const old = approval('old');
+    const next = approval('next');
+    act(() => {
+      result.current.submit('first');
+      park(1, old);
+    });
+    act(() => {
+      result.current.resetTranscript([]);
+      result.current.submit('new');
+      park(2, next);
+    });
+    expect(result.current.waitingCalls[0]).toBe(next);
+    await act(async () => live.waiters.shift()!());
+    expect(result.current.waitingCalls[0]).toBe(next);
+    expect(result.current.streaming).toBe(true);
+    expect(next.confirmationDetails.onConfirm).not.toHaveBeenCalled();
+    await act(async () => live.waiters.shift()!());
+  });
+
+  it('keeps live approval actionable until normal confirmation', async () => {
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+    const call = approval('normal');
+    const onComplete = vi.fn();
+    act(() => {
+      result.current.submit('first', undefined, { onComplete });
+      park(1, call);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.waitingCalls[0]).toBe(call);
+    expect(result.current.streaming).toBe(true);
+    await act(async () => {
+      await call.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+      );
+      result.current.settleWaitingCall(call.callId);
+      live.waiters.shift()!();
+    });
+    expect(result.current.waitingCalls).toEqual([]);
+    expect(call.confirmationDetails.onConfirm).toHaveBeenCalledExactlyOnceWith(
+      ToolConfirmationOutcome.ProceedOnce,
+    );
+    expect(onComplete).toHaveBeenCalledOnce();
+  });
+
+  it('fires onComplete once when a turn completes without an abort', async () => {
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+    const onComplete = vi.fn();
+
+    act(() => {
+      result.current.submit('plain prompt', undefined, { onComplete });
+    });
+    await act(async () => {
+      for (const wake of live.waiters.splice(0)) wake();
+    });
+    await vi.waitFor(() => expect(result.current.streaming).toBe(false));
+
+    expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fire onComplete when the turn ends on an aborted signal (R6-6)', async () => {
+    // Esc while a tool batch is out: the generator's abort paths (the
+    // all-cancelled batch above them) end with a normal return, so the seq
+    // guard alone passes and the signal has to settle it — a command's
+    // onComplete (e.g. /dream's manual-run recording) must not run for a turn
+    // the user cancelled.
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+    const onComplete = vi.fn();
+
+    act(() => {
+      result.current.submit('dream prompt', undefined, { onComplete });
+    });
+    act(() => {
+      result.current.interrupt();
+    });
+    expect(live.signals[0]?.aborted).toBe(true);
+
+    await act(async () => {
+      for (const wake of live.waiters.splice(0)) wake();
+    });
+    await vi.waitFor(() => expect(result.current.streaming).toBe(false));
+
+    expect(onComplete).not.toHaveBeenCalled();
   });
 
   it('forwards per-turn options through the idle submit hop (R1-4)', () => {
@@ -208,7 +386,7 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     act(() => {
       result.current.submit('look @notes.md');
     });
-    expect(result.current.queueLength).toBe(1);
+    expect(result.current.messageQueue).toEqual(['look @notes.md']);
 
     await act(async () => {
       for (const wake of live.waiters.splice(0)) wake();
@@ -223,7 +401,7 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     expect(live.turns[1]?.options).toMatchObject({
       submittedPrompt: 'look @notes.md',
     });
-    expect(result.current.queueLength).toBe(0);
+    expect(result.current.messageQueue).toEqual([]);
   });
 
   it('consumes only its own submission when a replayed turn declines (R2-2)', async () => {
@@ -245,7 +423,10 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     act(() => {
       result.current.submit('then do the other thing');
     });
-    expect(result.current.queueLength).toBe(2);
+    expect(result.current.messageQueue).toEqual([
+      'look @notes.md',
+      'then do the other thing',
+    ]);
 
     await act(async () => {
       for (const wake of live.waiters.splice(0)) wake();
@@ -254,7 +435,7 @@ describe('useOpenTuiLiveTurn submit paths', () => {
 
     expect(live.turns[1]?.prompt).toBe('look @notes.md');
     expect(live.turns[2]?.prompt).toBe('then do the other thing');
-    expect(result.current.queueLength).toBe(0);
+    expect(result.current.messageQueue).toEqual([]);
   });
 
   it('restores a dropped steering batch at the front of the queue', () => {
@@ -272,7 +453,7 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     act(() => {
       result.current.submit('queued after');
     });
-    expect(result.current.queueLength).toBe(1);
+    expect(result.current.messageQueue).toEqual(['queued after']);
 
     const { restoreSteering } = live.turns[0]?.options as unknown as {
       restoreSteering: (texts: readonly string[]) => void;
@@ -280,14 +461,141 @@ describe('useOpenTuiLiveTurn submit paths', () => {
     act(() => {
       restoreSteering(['  steer me  ', '', 'then @b.ts']);
     });
-    expect(result.current.queueLength).toBe(3);
+    expect(result.current.messageQueue).toEqual([
+      'steer me',
+      'then @b.ts',
+      'queued after',
+    ]);
 
     let popped: string | null = null;
     act(() => {
       popped = result.current.popQueue();
     });
 
-    expect(result.current.queueLength).toBe(0);
-    expect(popped).toBe('steer me\nthen @b.ts\nqueued after');
+    expect(result.current.messageQueue).toEqual([]);
+    expect(popped).toBe('steer me\n\nthen @b.ts\n\nqueued after');
+  });
+
+  it('drops the visible queue rows when the transcript resets', () => {
+    // `/clear` and a session switch rebuild the transcript. A stale row would
+    // keep advertising a prompt the following turn never runs.
+    const { result } = renderHook(() =>
+      useOpenTuiLiveTurn({ config: {} as Config }),
+    );
+
+    act(() => {
+      result.current.submit('first prompt');
+    });
+    act(() => {
+      result.current.submit('queued after');
+    });
+    expect(result.current.messageQueue).toEqual(['queued after']);
+
+    act(() => {
+      result.current.resetTranscript([]);
+    });
+    expect(result.current.messageQueue).toEqual([]);
+  });
+});
+
+describe('useOpenTuiLiveTurn streaming counters', () => {
+  beforeEach(() => {
+    live.turns.length = 0;
+    live.waiters.length = 0;
+    live.declines.clear();
+    live.signals.length = 0;
+    live.script.clear();
+    live.holds.clear();
+    live.errors.clear();
+  });
+
+  function renderTurn() {
+    return renderHook(() => useOpenTuiLiveTurn({ config: {} as Config }));
+  }
+
+  async function settle(result: { current: { streaming: boolean } }) {
+    await act(async () => {
+      for (const wake of live.waiters.splice(0)) wake();
+    });
+    await vi.waitFor(() => expect(result.current.streaming).toBe(false));
+  }
+
+  it('counts model text, thoughts and tool args, but never tool output', async () => {
+    live.script.set(1, [
+      { type: 'thinking', delta: 'hmm' },
+      { type: 'text', delta: 'hello there' },
+      {
+        type: 'tool-start',
+        id: 'c1',
+        tool: 'run_shell_command',
+        title: 'ls',
+      },
+      { type: 'tool-args', id: 'c1', args: '{"command":"ls"}' },
+      // Tool-generated, not model-generated: ink leaves it out of the estimate.
+      { type: 'tool-output', id: 'c1', output: 'a lot of stdout' },
+      { type: 'tool-end', id: 'c1', success: true, summary: '' },
+    ]);
+    const { result } = renderTurn();
+
+    act(() => {
+      result.current.submit('go');
+    });
+    await settle(result);
+
+    expect(result.current.streamingCharsRef.current).toBe(
+      'hmm'.length + 'hello there'.length + '{"command":"ls"}'.length,
+    );
+  });
+
+  it('marks content as receiving once model text arrives', async () => {
+    live.script.set(1, [{ type: 'text', delta: 'here you go' }]);
+    const { result } = renderTurn();
+
+    act(() => {
+      result.current.submit('go');
+    });
+    await settle(result);
+
+    expect(result.current.isReceivingContent).toBe(true);
+  });
+
+  it('returns to the waiting-on-API state once the tool batch ends', async () => {
+    live.script.set(1, [
+      { type: 'text', delta: 'let me look' },
+      {
+        type: 'tool-start',
+        id: 'c1',
+        tool: 'run_shell_command',
+        title: 'ls',
+      },
+      { type: 'tool-end', id: 'c1', success: true, summary: '' },
+    ]);
+    const { result } = renderTurn();
+
+    act(() => {
+      result.current.submit('go');
+    });
+    await settle(result);
+
+    expect(result.current.isReceivingContent).toBe(false);
+  });
+
+  it('restarts the counter for each new user turn', async () => {
+    live.script.set(1, [{ type: 'text', delta: 'aaaa' }]);
+    live.script.set(2, [{ type: 'text', delta: 'bb' }]);
+    const { result } = renderTurn();
+
+    act(() => {
+      result.current.submit('one');
+    });
+    await settle(result);
+    expect(result.current.streamingCharsRef.current).toBe(4);
+
+    act(() => {
+      result.current.submit('two');
+    });
+    await vi.waitFor(() =>
+      expect(result.current.streamingCharsRef.current).toBe(2),
+    );
   });
 });

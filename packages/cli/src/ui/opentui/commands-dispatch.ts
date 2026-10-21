@@ -58,10 +58,15 @@ import {
 } from '../utils/commandUtils.js';
 import { recordAutoSkillCommandUsage } from '../../services/SkillCommandLoader.js';
 import {
+  sanitizeTerminalText,
+  stripUnsafeCharacters,
+} from '../utils/textUtils.js';
+import {
   ExtensionRefreshState,
   EXTENSION_RELOAD_FAILED_REASON,
 } from '../../config/extension-refresh-state.js';
 import { AppEvent } from '../../utils/events.js';
+import { t } from '../../i18n/index.js';
 import { refreshExtensionContentRuntime } from '../../config/extension-runtime-reload.js';
 import { isPickerOnlyModelInvocation } from '../commands/modelCommand.js';
 import {
@@ -71,6 +76,11 @@ import {
 } from '../../utils/userPromptExpansionHook.js';
 import type { RecentSlashCommand } from '../hooks/useSlashCompletion.js';
 import { loadInteractiveCommands } from './slash-dispatch.js';
+import {
+  getInteractiveModSession,
+  isModRecoveryCommand,
+} from '../../services/interactive-mod-session.js';
+import { ensureConfigInitialized } from './live-session.js';
 import {
   createOpenTuiCommandContext,
   type OpenTuiCommandHost,
@@ -169,6 +179,7 @@ interface RunOptions {
   oneTimeShellAllowlist?: Set<string>;
   overwriteConfirmed?: boolean;
   existingInvocationItemId?: number;
+  wasIdleBeforeDispatch?: boolean;
 }
 
 /**
@@ -193,8 +204,13 @@ const MAX_EXTENSION_CONTENT_REFRESH_PASSES = 5;
 const STARTUP_REGISTRY_WAIT_MS = 15_000;
 const STARTUP_REGISTRY_POLL_MS = 100;
 
+const replayedExtensionRefresh = new WeakSet<ExtensionRefreshState>();
+
 export class OpenTuiSlashDispatcher {
-  private activeAbortController: AbortController | null = null;
+  private activeCommand: {
+    controller: AbortController;
+    canCancel: boolean;
+  } | null = null;
   private recentCommands = new Map<string, RecentSlashCommand>();
   private readonly extensionRefreshState: ExtensionRefreshState;
   private readonly extensionRefreshListeners: Array<() => void> = [];
@@ -226,8 +242,12 @@ export class OpenTuiSlashDispatcher {
           type: MessageType.INFO,
           text:
             reason === EXTENSION_RELOAD_FAILED_REASON
-              ? 'Extension reload did not complete. Run /reload-plugins to try again.'
-              : 'Extensions changed on disk. Run /reload-plugins to apply updates.',
+              ? t(
+                  'Extension reload did not complete. Run /reload-plugins to try again.',
+                )
+              : t(
+                  'Extensions changed on disk. Run /reload-plugins to apply updates.',
+                ),
         },
         Date.now(),
       );
@@ -242,6 +262,21 @@ export class OpenTuiSlashDispatcher {
         refreshNeededListener,
       );
     });
+    // The watcher starts during CLI startup, before this renderer mounts, and
+    // markExtensionsChanged() latches instead of re-emitting — so subscribing
+    // alone drops the one notice that tells the user to run /reload-plugins.
+    // The latch outlives this dispatcher (only /reload-plugins clears it) and
+    // the shell rebuilds the dispatcher whenever its host identity changes, so
+    // the replay is keyed on the latch owner rather than the construction.
+    // The latch keeps no reason, so a replay always reads as a plain change —
+    // both wordings send the user to /reload-plugins either way.
+    if (
+      this.extensionRefreshState.needsExtensionRefresh() &&
+      !replayedExtensionRefresh.has(this.extensionRefreshState)
+    ) {
+      replayedExtensionRefresh.add(this.extensionRefreshState);
+      refreshNeededListener();
+    }
 
     // ink's processor debounce ExtensionContentChanged by 250ms and then
     // re-runs the runtime refresh (command registry + extension content).
@@ -399,7 +434,7 @@ export class OpenTuiSlashDispatcher {
   }
 
   /** Whether {@link handle} processes this input instead of handing it back. */
-  private takesAsSlashCommand(trimmed: string): boolean {
+  takesAsSlashCommand(trimmed: string): boolean {
     if (!trimmed.startsWith('/') && !trimmed.startsWith('?')) {
       return false;
     }
@@ -412,10 +447,10 @@ export class OpenTuiSlashDispatcher {
    */
   cancel(): void {
     this.host.cancelBtw();
-    if (!this.activeAbortController) {
+    if (!this.activeCommand?.canCancel) {
       return;
     }
-    this.activeAbortController.abort();
+    this.activeCommand.controller.abort();
     this.host.addItem(
       { type: MessageType.INFO, text: 'Command cancelled.' },
       Date.now(),
@@ -456,9 +491,14 @@ export class OpenTuiSlashDispatcher {
       return this.host.addItem(item, timestamp);
     };
 
+    // Read before setIsProcessing(true), which makes host.isIdle() false.
+    // A confirmed re-run inherits the outer snapshot.
+    const wasIdleBeforeDispatch =
+      options.wasIdleBeforeDispatch ?? this.host.isIdle();
     this.host.setIsProcessing(true);
     const abortController = new AbortController();
-    this.activeAbortController = abortController;
+    const activeCommand = { controller: abortController, canCancel: true };
+    this.activeCommand = activeCommand;
 
     const userMessageTimestamp = Date.now();
     let invocationItemId = options.existingInvocationItemId;
@@ -534,6 +574,14 @@ export class OpenTuiSlashDispatcher {
     };
 
     try {
+      const config = this.services.config;
+      if (
+        config &&
+        getInteractiveModSession(config) &&
+        !isModRecoveryCommand(commandToExecute)
+      ) {
+        await ensureConfigInitialized(config);
+      }
       const stackedResult = parseStackedSlashCommands(
         trimmed,
         this.commandList,
@@ -641,6 +689,7 @@ export class OpenTuiSlashDispatcher {
           const baseContext = createOpenTuiCommandContext(
             this.host,
             this.services,
+            { wasIdleBeforeDispatch },
           );
           const fullCommandContext: CommandContext = {
             ...baseContext,
@@ -684,6 +733,7 @@ export class OpenTuiSlashDispatcher {
           // listener registered after the signal already aborted never
           // fires, so the race would otherwise await the action's side
           // effects (session rotation, telemetry reset) before discarding.
+          activeCommand.canCancel = commandToExecute.canCancel !== false;
           const result = abortController.signal.aborted
             ? undefined
             : await Promise.race([
@@ -733,7 +783,8 @@ export class OpenTuiSlashDispatcher {
               }
               case 'goal_control': {
                 const rendersHere =
-                  result.cause === undefined || this.host.isIdle();
+                  result.cause === undefined ||
+                  fullCommandContext.ui.isIdleRef.current;
                 if (rendersHere) {
                   const snapshot = result.response.snapshot;
                   if (snapshot.goal || result.cause === 'clear') {
@@ -866,6 +917,7 @@ export class OpenTuiSlashDispatcher {
                   // Approved commands are a one-time grant for this execution.
                   oneTimeShellAllowlist: new Set(approvedCommands),
                   existingInvocationItemId: invocationItemId,
+                  wasIdleBeforeDispatch,
                 });
               }
               case 'confirm_action': {
@@ -885,6 +937,7 @@ export class OpenTuiSlashDispatcher {
                 return await this.run(result.originalInvocation.raw, {
                   overwriteConfirmed: true,
                   existingInvocationItemId: invocationItemId,
+                  wasIdleBeforeDispatch,
                 });
               }
               case 'stream_messages': {
@@ -940,7 +993,9 @@ export class OpenTuiSlashDispatcher {
       addItemWithRecording(
         {
           type: MessageType.ERROR,
-          text: e instanceof Error ? e.message : String(e),
+          text: sanitizeTerminalText(
+            stripUnsafeCharacters(e instanceof Error ? e.message : String(e)),
+          ),
         },
         Date.now(),
       );
@@ -998,7 +1053,10 @@ export class OpenTuiSlashDispatcher {
         });
         logSlashCommand(this.services.config, event);
       }
-      this.host.setIsProcessing(false);
+      if (this.activeCommand === activeCommand) {
+        this.activeCommand = null;
+        this.host.setIsProcessing(false);
+      }
     }
   }
 }
