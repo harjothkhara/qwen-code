@@ -157,6 +157,12 @@ export { useDaemonTranscriptState as useTranscriptState } from './daemon/session
 /** Direct access to the transcript store (subscribe, getSnapshot). */
 export { useDaemonTranscriptStore as useTranscriptStore } from './daemon/session/index.js';
 
+/** Headless session-wide turn metadata and historical-page state. */
+export { useDaemonTurnNavigationState as useTurnNavigationState } from './daemon/session/index.js';
+
+/** Direct access to the session-wide turn navigation external store. */
+export { useDaemonTurnNavigationStore as useTurnNavigationStore } from './daemon/session/index.js';
+
 /** Low-level prompt lifecycle status (queued, streaming, idle). */
 export { useDaemonPromptStatus as usePromptStatus } from './daemon/session/index.js';
 
@@ -218,6 +224,16 @@ export type {
   /** Props accepted by `<DaemonSessionProvider>`. */
   DaemonSessionProviderProps,
   DaemonTranscriptHistory,
+  DaemonProvisionalTurn,
+  DaemonSelectedTurnState,
+  DaemonTurnIndexPage,
+  DaemonTurnLocation,
+  DaemonTurnNavigationError,
+  DaemonTurnNavigationSnapshot,
+  DaemonTurnNavigationStore,
+  HistoricalTranscriptPage,
+  HistoricalTranscriptRange,
+  TranscriptBoundary,
   /** Streaming lifecycle: `'idle' | 'waiting' | 'responding' | 'thinking'`. */
   DaemonStreamingState,
   /** Prompt submission status: `'idle' | 'waiting' | 'streaming'`. */
@@ -315,8 +331,14 @@ export type {
   DaemonGoal,
   /** The `GET /goals` payload: the goals plus a count of unreachable sessions. */
   DaemonGoalList,
+  /** One `/autofix-pr` watch of a workspace's clone, as `status` lists it. */
+  DaemonAutofixPrWatch,
+  /** The `GET /autofix-pr/watches` payload. */
+  DaemonAutofixPrWatchList,
   /** A durable scheduled task (cron) as returned by the daemon. */
   DaemonScheduledTask,
+  /** Summary of a gated task's recent gate runs. */
+  DaemonScheduledTaskGateStatus,
   /** One recorded fire in a scheduled task's run history. */
   DaemonScheduledTaskRun,
   /** Request body for creating a scheduled task. */

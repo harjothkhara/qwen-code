@@ -16,6 +16,9 @@ import {
 } from '@qwen-code/web-shell';
 import {
   DaemonClient,
+  DaemonHttpError,
+  findDaemonRewindUserBlock,
+  isDaemonRewindUserBlock,
   type DaemonSessionSummary,
   type DaemonTranscriptBlock,
 } from '@qwen-code/sdk/daemon';
@@ -40,6 +43,45 @@ import { isDiscontinuedModel } from './utils/discontinuedModel.js';
 
 const SESSION_SWITCH_TIMEOUT_MS = 15_000;
 const SESSION_SWITCH_MIN_VISIBLE_MS = 120;
+
+/** Longest an edit submit waits for the rewind to land in the transcript. */
+const REWIND_APPLIED_TIMEOUT_MS = 2_000;
+
+/**
+ * Conversational user turns — the blocks a rewind indexes against.
+ * `mid_turn_message_injected` renders as `role: 'system'`, so the web shell's
+ * ordinal never numbers it; counting it here shifts every later index.
+ */
+function isEditableUserBlock(
+  block: DaemonTranscriptBlock | undefined,
+): boolean {
+  return isDaemonRewindUserBlock(block);
+}
+
+function countEditableUserTurns(
+  blocks: readonly DaemonTranscriptBlock[],
+): number {
+  return blocks.filter(isEditableUserBlock).length;
+}
+
+function waitForRewindApplied(
+  getBlocks: () => readonly DaemonTranscriptBlock[],
+  targetTurnIndex: number,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + REWIND_APPLIED_TIMEOUT_MS;
+    const poll = () => {
+      if (countEditableUserTurns(getBlocks()) <= targetTurnIndex) {
+        resolve(true);
+      } else if (Date.now() >= deadline) {
+        resolve(false);
+      } else {
+        setTimeout(poll, 16);
+      }
+    };
+    poll();
+  });
+}
 
 const COMPOSER_TOOLBAR_ACTIONS = [
   'approvalMode',
@@ -206,6 +248,13 @@ interface RuntimeConfig {
   token?: string;
   clientId?: string;
   workspaceCwd?: string;
+  /**
+   * The workspace path as VS Code spells it, sent only when it differs from
+   * the canonical `workspaceCwd` (a symlinked folder). Every
+   * `activeEditorChanged` payload carries a raw `uri.fsPath`, so relativizing
+   * the active file has to accept either spelling.
+   */
+  editorWorkspaceCwd?: string;
   sessionId?: string;
   hostKind?: 'view' | 'panel';
 }
@@ -255,7 +304,7 @@ interface InsightProgress {
 }
 
 interface EditingMessage {
-  turnIndex?: number;
+  blockId?: string;
 }
 
 function isAutomaticApprovalMode(modeId: unknown): boolean {
@@ -331,19 +380,25 @@ export function EmbeddedApp() {
     | undefined
   >(undefined);
   const sessionSwitchStartedAtRef = useRef(0);
+  const sessionHistoryRequestRef = useRef(0);
   const sessionSwitchTimerRef = useRef<
     ReturnType<typeof setTimeout> | undefined
   >(undefined);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const appRootRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<WebShellApi | null>(null);
   const composerRef = useRef<WebShellComposerApi | null>(null);
   const currentModelIdRef = useRef<string | undefined>(undefined);
   const transcriptBlocksRef = useRef<readonly DaemonTranscriptBlock[]>([]);
   const openPermissionDiffsRef = useRef(new Map<string, string>());
+  // The request whose host-owned diff the user closed without voting. While it
+  // is set, the host does not reopen that diff and hands the edit preview back
+  // to the web shell, which renders it inline (#10557).
+  const dismissedPermissionDiffIdRef = useRef<string | undefined>(undefined);
+  const [hostOwnsEditDiffPreview, setHostOwnsEditDiffPreview] = useState(true);
   const webShellPermissionRequestIdRef = useRef<string | undefined>(undefined);
   const focusedPermissionRequestIdRef = useRef<string | undefined>(undefined);
   const contextMenuRowKeyRef = useRef<string | null>(null);
-  const previousActiveFilePathRef = useRef<string | undefined>(undefined);
   const daemonBaseUrl = runtime?.baseUrl;
   const daemonToken = runtime?.token;
   const daemonClient = useMemo(
@@ -407,7 +462,10 @@ export function EmbeddedApp() {
 
   const loadSessionHistory = useCallback(
     async (cursor?: string) => {
-      if (!daemonClient || !runtime?.workspaceCwd || sessionListLoading) return;
+      if (!daemonClient || !runtime?.workspaceCwd || sessionListLoading) {
+        return;
+      }
+      const requestId = ++sessionHistoryRequestRef.current;
       setSessionListLoading(true);
       setSessionListError(undefined);
       try {
@@ -417,15 +475,32 @@ export function EmbeddedApp() {
             pageSize: 20,
             cursor,
             archiveState: 'active',
-            // Only conversations started from VS Code. The daemon is shared
-            // with the CLI and the browser Web Shell for this workspace, so an
-            // unfiltered page lists sessions the user never opened here.
-            sourceType: VSCODE_SESSION_SOURCE_TYPE,
+            view: 'organized',
+            group: 'all',
           });
-        const pageSessions = Array.isArray(page.sessions) ? page.sessions : [];
+        const pageSessions = (
+          Array.isArray(page.sessions) ? page.sessions : []
+        ).filter(
+          (session) =>
+            !session.parentSessionId &&
+            // Live voice threads are ordinary 'default' sessions carrying a
+            // sourceId built from LIVE_SESSION_SOURCE_PREFIX in packages/cli;
+            // the literal is inlined since the CLI is not a bundle dependency.
+            !(
+              session.sourceType === 'default' &&
+              session.sourceId?.startsWith('realtime_voice:')
+            ) &&
+            !['scheduled_task', 'side_task', 'channel', 'qwen-live'].includes(
+              session.sourceType ?? '',
+            ),
+        );
+        if (requestId !== sessionHistoryRequestRef.current) return;
         setSessions((current) => {
           const merged = new Map(
-            current.map((session) => [session.sessionId, session]),
+            (cursor ? current : []).map((session) => [
+              session.sessionId,
+              session,
+            ]),
           );
           for (const session of pageSessions) {
             merged.set(session.sessionId, session);
@@ -444,12 +519,18 @@ export function EmbeddedApp() {
           return Array.from(merged.values());
         });
         setSessionCursor(page.nextCursor);
+        setSessionListError(
+          page.truncated ? t('session.historyIncomplete') : undefined,
+        );
       } catch (error) {
+        if (requestId !== sessionHistoryRequestRef.current) return;
         setSessionListError(
           error instanceof Error ? error.message : t('session.loadFailed'),
         );
       } finally {
-        setSessionListLoading(false);
+        if (requestId === sessionHistoryRequestRef.current) {
+          setSessionListLoading(false);
+        }
       }
     },
     [
@@ -497,6 +578,8 @@ export function EmbeddedApp() {
       vscode.postMessage({ type: 'closeDiff', data: { path, requestId } });
     }
     openPermissionDiffsRef.current.clear();
+    dismissedPermissionDiffIdRef.current = undefined;
+    setHostOwnsEditDiffPreview(true);
     if (webShellPermissionRequestIdRef.current) {
       webShellPermissionRequestIdRef.current = undefined;
       vscode.postMessage({
@@ -523,7 +606,8 @@ export function EmbeddedApp() {
           const { path, oldText, newText } = diff;
           pendingIds.add(pendingPermission.requestId);
           if (
-            !openPermissionDiffsRef.current.has(pendingPermission.requestId)
+            !openPermissionDiffsRef.current.has(pendingPermission.requestId) &&
+            dismissedPermissionDiffIdRef.current !== pendingPermission.requestId
           ) {
             openPermissionDiffsRef.current.set(
               pendingPermission.requestId,
@@ -549,6 +633,13 @@ export function EmbeddedApp() {
           type: 'closeDiff',
           data: { path, requestId },
         });
+      }
+      if (
+        dismissedPermissionDiffIdRef.current !== undefined &&
+        dismissedPermissionDiffIdRef.current !== permissionToFocus
+      ) {
+        dismissedPermissionDiffIdRef.current = undefined;
+        setHostOwnsEditDiffPreview(true);
       }
       const pendingDiffRequestId = pendingIds.values().next().value as
         | string
@@ -614,6 +705,33 @@ export function EmbeddedApp() {
       document.removeEventListener('contextmenu', trackContextMenu, true);
   }, [vscode]);
 
+  // VS Code 1.143's webview guest script refocuses the webview's last
+  // focused element right before running a clipboard execCommand (Ctrl+C,
+  // context-menu Copy). The last focused element here is the composer's
+  // contenteditable, and focusing an editable collapses the document text
+  // selection, so the copy runs on an empty selection and lands nothing in
+  // the clipboard. Keep the app root (a non-editable element) focused while
+  // the pointer presses into a non-interactive area: focusing a
+  // non-editable div preserves the selection, and an activeElement that is
+  // not <body> makes the guest script skip the refocus.
+  useEffect(() => {
+    const keepSelectionFocus = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      if (
+        target.closest(
+          'button, a, input, textarea, select, [contenteditable="true"], [role="button"]',
+        )
+      ) {
+        return;
+      }
+      appRootRef.current?.focus({ preventScroll: true });
+    };
+    document.addEventListener('pointerdown', keepSelectionFocus, true);
+    return () =>
+      document.removeEventListener('pointerdown', keepSelectionFocus, true);
+  }, []);
+
   useEffect(() => {
     const handleCopyCommand = (event: MessageEvent) => {
       const message = event.data as {
@@ -668,19 +786,46 @@ export function EmbeddedApp() {
         message.type === 'webShellBootstrap' &&
         typeof message.data?.baseUrl === 'string'
       ) {
-        setRuntime(
-          message.data as NonNullable<ReturnType<typeof readRuntimeConfig>>,
-        );
+        const nextRuntime = message.data as NonNullable<
+          ReturnType<typeof readRuntimeConfig>
+        >;
+        sessionHistoryRequestRef.current++;
+        setSessionHistoryOpen(false);
+        setSessions([]);
+        setSessionCursor(undefined);
+        setSessionListLoading(false);
+        setSessionListError(undefined);
+        setRuntime(nextRuntime);
       } else if (message.type === 'webShellBootstrapError') {
-        const errorMessage = (message.data as { message?: unknown } | null)
-          ?.message;
+        const errorData = message.data as {
+          message?: unknown;
+          reason?: unknown;
+        } | null;
         const text =
-          typeof errorMessage === 'string' ? errorMessage : t('boot.failed');
+          errorData?.reason === 'daemonPreAuthHostGate'
+            ? t('boot.preAuthHostGate')
+            : typeof errorData?.message === 'string'
+              ? errorData.message
+              : t('boot.failed');
         setRuntimeError(text);
         // Before bootstrap this renders as the full-panel startup state. After
         // it, `runtime` is set and that branch is gone, so the same failure
         // would be invisible — show it over the transcript instead.
         if (runtimeRef.current) setHostNotice({ tone: 'error', text });
+      } else if (message.type === 'permissionDiffClosed') {
+        const requestId = (message.data as { requestId?: unknown } | null)
+          ?.requestId;
+        // Same source gate as the decision handler below: MCP apps and artifact
+        // previews run in scriptable sandboxed iframes inside this webview and
+        // can postMessage here. This is not a vote, but it does flip who owns
+        // the edit preview, so only the preload parent frame may send it.
+        if (typeof requestId === 'string' && event.source === window.parent) {
+          openPermissionDiffsRef.current.delete(requestId);
+          if (webShellPermissionRequestIdRef.current === requestId) {
+            dismissedPermissionDiffIdRef.current = requestId;
+            setHostOwnsEditDiffPreview(false);
+          }
+        }
       } else if (message.type === 'webShellPermissionDecision') {
         const decisionData = message.data as {
           decision?: unknown;
@@ -842,16 +987,8 @@ export function EmbeddedApp() {
             filePath: data.filePath,
             selection: data.selection,
           });
-          // The host fires this on every selection change, including plain
-          // cursor moves; only an actual file change may re-arm inclusion,
-          // or a click silently undoes the user's explicit exclusion.
-          if (previousActiveFilePathRef.current !== data.filePath) {
-            setIncludeActiveFile(true);
-          }
-          previousActiveFilePathRef.current = data.filePath;
         } else {
           setActiveFile(undefined);
-          previousActiveFilePathRef.current = undefined;
         }
       } else if (
         message.type === 'modeChanged' ||
@@ -943,7 +1080,14 @@ export function EmbeddedApp() {
 
   return (
     <div
-      style={{ ...ROOT_STYLE, position: 'relative', flexDirection: 'column' }}
+      ref={appRootRef}
+      tabIndex={-1}
+      style={{
+        ...ROOT_STYLE,
+        position: 'relative',
+        flexDirection: 'column',
+        outline: 'none',
+      }}
       data-vscode-context='{"webviewSection":"chat-messages"}'
     >
       <style>{VSCODE_EMBEDDED_CSS}</style>
@@ -978,7 +1122,9 @@ export function EmbeddedApp() {
             });
           }}
           onRename={async (session, title) => {
-            if (!daemonClient || !runtime.workspaceCwd) return;
+            if (!daemonClient || !runtime.workspaceCwd) {
+              return;
+            }
             setSessionListError(undefined);
             try {
               const result = await daemonClient
@@ -1375,7 +1521,9 @@ export function EmbeddedApp() {
           style={SHELL_STYLE}
           theme={theme}
           language={language}
-          sessionSourceType={VSCODE_SESSION_SOURCE_TYPE}
+          sessionSourceType={
+            runtime.sessionId ? undefined : VSCODE_SESSION_SOURCE_TYPE
+          }
           shellRef={shellRef}
           header={{ items: [] }}
           onSessionIdChange={(sessionId) => {
@@ -1385,7 +1533,10 @@ export function EmbeddedApp() {
             setEditingMessage(undefined);
             vscode.postMessage({
               type: 'webShellSessionChanged',
-              data: { sessionId, workspaceCwd: runtime.workspaceCwd },
+              data: {
+                sessionId,
+                workspaceCwd: runtime.workspaceCwd,
+              },
             });
             setRuntime((current) =>
               current && current.sessionId !== sessionId
@@ -1423,7 +1574,7 @@ export function EmbeddedApp() {
           sidebar={false}
           compactThinking
           collapseCompletedTurns
-          hostOwnsEditDiffPreview
+          hostOwnsEditDiffPreview={hostOwnsEditDiffPreview}
           composerToolbarActions={COMPOSER_TOOLBAR_ACTIONS}
           mainModelFilter={isVsCodeModelVisible}
           compactComposerOverlays
@@ -1464,11 +1615,16 @@ export function EmbeddedApp() {
             const editContent = queuedPromptForEdit
               ? queuedPromptForEdit.prompt
               : content;
+            const target =
+              transcriptBlocksRef.current.filter(isEditableUserBlock)[
+                turnIndex
+              ];
+            if (!editsQueuedPrompt && !target) return false;
             composerRef.current?.clear({ text: true, tags: true });
             composerRef.current?.setText(editContent);
             composerRef.current?.focus?.();
             setEditingMessage({
-              turnIndex: editsQueuedPrompt ? undefined : turnIndex,
+              blockId: editsQueuedPrompt ? undefined : target?.id,
             });
             return true;
           }}
@@ -1500,47 +1656,119 @@ export function EmbeddedApp() {
           }}
           composerRef={composerRef}
           prepareSubmit={async (submission) => {
+            if (submission.source === 'mcp-app') return undefined;
             if (editingMessage) {
+              const { blockId } = editingMessage;
+              setEditingMessage(undefined);
               const sessionId = submission.sessionId ?? runtime.sessionId;
               if (!daemonClient || !sessionId) {
                 throw new Error(t('composer.editUnavailable'));
               }
-              const { snapshots } =
-                await daemonClient.getRewindSnapshots(sessionId);
-              const snapshot =
-                editingMessage.turnIndex === undefined
-                  ? snapshots.reduce<(typeof snapshots)[number] | undefined>(
-                      (latest, entry) =>
-                        !latest || entry.turnIndex > latest.turnIndex
-                          ? entry
-                          : latest,
-                      undefined,
-                    )
-                  : snapshots.find(
-                      (entry) => entry.turnIndex === editingMessage.turnIndex,
-                    );
-              if (!snapshot) {
-                throw new Error(t('composer.editExpired'));
+              const blocks = transcriptBlocksRef.current;
+              const userBlocks = blocks.filter(isEditableUserBlock);
+              const target =
+                blockId === undefined
+                  ? userBlocks.at(-1)
+                  : userBlocks.find((block) => block.id === blockId);
+              // The clear above is unconditional so no refusal can wedge the
+              // next send, but a transient daemon failure has to re-arm the
+              // edit: the message says "Please try again", and a retry that
+              // skipped the rewind would append the edited text as a new turn
+              // instead of replacing the original. Only permanent 4xx refusals
+              // stay cleared, so a rewind that can never succeed cannot wedge
+              // the composer again. Never `cancelMessageEditing` here — it
+              // wipes the composer text the retry needs.
+              const rearmOnTransientFailure = (error: unknown) => {
+                if (runtimeRef.current?.sessionId !== sessionId) return;
+                if (error instanceof DaemonHttpError && error.status < 500) {
+                  return;
+                }
+                setEditingMessage({ blockId });
+              };
+              let snapshots: Awaited<
+                ReturnType<typeof daemonClient.getRewindSnapshots>
+              >['snapshots'];
+              try {
+                ({ snapshots } =
+                  await daemonClient.getRewindSnapshots(sessionId));
+              } catch (err) {
+                rearmOnTransientFailure(err);
+                throw new Error(t('composer.editFailed'), { cause: err });
               }
-              await daemonClient.rewindSession(sessionId, snapshot.promptId, {
-                clientId: runtime.clientId,
-                rewindFiles: false,
-              });
-              setEditingMessage(undefined);
+              const matches =
+                target?.promptId &&
+                findDaemonRewindUserBlock(blocks, target.promptId)?.id ===
+                  target.id
+                  ? snapshots.filter(
+                      (entry) => entry.daemonPromptId === target.promptId,
+                    )
+                  : [];
+              const snapshot = matches.length === 1 ? matches[0] : undefined;
+              if (!snapshot || !target) {
+                const reason =
+                  snapshots.length > 0 &&
+                  snapshots.every((entry) => !entry.daemonPromptId)
+                    ? 'composer.editIdentityUnavailable'
+                    : 'composer.editExpired';
+                throw new Error(t(reason));
+              }
+              try {
+                // No X-Qwen-Client-Id on purpose: the daemon registers a
+                // session-bound id (`client_<uuid>`) at create/load that the
+                // raw DaemonClient here never learns, and the extension's own
+                // `vscode-<uuid>` is not registered either — sending it makes
+                // the rewind 400 `invalid_client_id`. Like the host's other
+                // session mutations (rename, delete), the rewind is
+                // unattributed and still token-authenticated.
+                await daemonClient.rewindSession(sessionId, snapshot.promptId, {
+                  rewindFiles: false,
+                });
+              } catch (err) {
+                rearmOnTransientFailure(err);
+                throw new Error(t('composer.editFailed'), { cause: err });
+              }
               clearInsight();
+              // The daemon delivers `session.rewound` on the session stream,
+              // which lands in the transcript store after the rewind HTTP
+              // response resolves. Returning now would let the web shell add
+              // its optimistic user message before the rewind event truncates
+              // the transcript, and that late truncation would wipe the
+              // message from the view. Skip the failure when the user has
+              // navigated to another session — the send is cancelled on
+              // switch and the transcript reloads from the daemon anyway.
+              if (
+                !(await waitForRewindApplied(
+                  () => transcriptBlocksRef.current,
+                  userBlocks.indexOf(target),
+                )) &&
+                runtimeRef.current?.sessionId === sessionId
+              ) {
+                throw new Error(t('composer.editSyncFailed'));
+              }
             }
 
             if (!activeFile || !includeActiveFile) return undefined;
-            const normalizedWorkspace = runtime.workspaceCwd?.replace(
-              /\\/g,
-              '/',
-            );
             const normalizedFile = activeFile.filePath.replace(/\\/g, '/');
-            const relativePath =
-              normalizedWorkspace &&
-              normalizedFile.startsWith(`${normalizedWorkspace}/`)
-                ? normalizedFile.slice(normalizedWorkspace.length + 1)
-                : activeFile.fileName;
+            // `workspaceCwd` is canonical — the daemon matches workspaces by
+            // realpath — while `activeFile.filePath` is VS Code's raw
+            // `uri.fsPath`, so in a symlinked folder the two sit in different
+            // path spaces. Try both spellings: on a miss the strip silently
+            // degrades to a bare basename, the prompt says `@foo.ts` instead
+            // of `@src/foo.ts`, and the picker-annotation dedup below misses
+            // with it.
+            const workspacePrefixes = [
+              runtime.workspaceCwd,
+              runtime.editorWorkspaceCwd,
+            ]
+              .filter((cwd): cwd is string => Boolean(cwd))
+              .map((cwd) => cwd.replace(/\\/g, '/'));
+            let relativePath = activeFile.fileName;
+            for (const prefix of workspacePrefixes) {
+              if (normalizedFile.startsWith(`${prefix}/`)) {
+                relativePath = normalizedFile.slice(prefix.length + 1);
+                break;
+              }
+            }
             const reference = `@${relativePath}`;
             const selectedLines = activeFile.selection
               ? ` (selected lines ${activeFile.selection.startLine}-${activeFile.selection.endLine})`

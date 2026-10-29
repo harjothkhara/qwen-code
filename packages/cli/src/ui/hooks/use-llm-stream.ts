@@ -5,6 +5,11 @@
  */
 
 import {
+  completeRestoreToolResponse,
+  type RestoreToolResponseBinding,
+} from '../utils/restore-tool-response.js';
+import { observeInteractiveModTool } from '../../services/interactive-mod-tool-observer.js';
+import {
   useState,
   useRef,
   useCallback,
@@ -34,6 +39,8 @@ import {
   createDebugLogger,
   ToolNames,
   goalToolResultProvenance,
+  goalPauseReasonForFailure,
+  GOAL_PAUSE_REASON_USER_INTERRUPT,
   getErrorMessage,
   isNodeError,
   MessageSenderType,
@@ -76,15 +83,24 @@ import {
   finalizeToolResponses,
   endInteractionSpan,
   getActiveInteractionSpan,
-  renderGoalContinuationPrompt,
+  decideNotificationAdmission,
+  DroppedNotificationTally,
+  MAX_BACKGROUND_NOTIFICATION_QUEUE,
+  type BackgroundNotificationKind,
+  renderGoalContinuationTurn,
+  getApiHistoryPromptId,
 } from '@qwen-code/qwen-code-core';
+import type { HumanPromptInput } from '@qwen-code/qwen-code-core/core/workflow-intent.js';
 import { type Part, type PartListUnion, FinishReason } from '@google/genai';
+import { getInteractiveModSession } from '../../services/interactive-mod-session.js';
+import type { ModTurn } from '../../services/mod-session.js';
 import type {
   HistoryItem,
   HistoryItemWithoutId,
   HistoryItemToolGroup,
   HistoryItemLlm,
   InlineImageData,
+  LoopDetectionConfirmationRequest,
   SlashCommandProcessorResult,
 } from '../types.js';
 import { StreamingState, MessageType, ToolCallStatus } from '../types.js';
@@ -93,7 +109,11 @@ import {
   isBtwCommand,
   isSlashCommand,
 } from '../utils/commandUtils.js';
-import { findLastUserItemIndex } from '../utils/historyUtils.js';
+import {
+  findLastUserItemIndex,
+  stripLeadingSystemReminders,
+} from '../utils/historyUtils.js';
+import { expandPendingPastePlaceholders } from '../utils/paste-placeholders.js';
 import { useShellCommandProcessor } from './shellCommandProcessor.js';
 import {
   handleAtCommand,
@@ -103,7 +123,7 @@ import {
   findLastSafeSplitPoint,
   splitFencedMarkdown,
   getEnclosingFenceInfo,
-} from '../utils/markdownUtilities.js';
+} from '../utils/markdown-utilities.js';
 import { fitPendingSlice } from '../utils/pending-rendered-height.js';
 import { useStateAndRef } from './useStateAndRef.js';
 import { normalizePartList } from '../../utils/normalize-part-list.js';
@@ -133,6 +153,15 @@ import {
   type QueuedGoalTurn,
 } from './useMessageQueue.js';
 import { classifyApiError } from '../../utils/classify-api-error.js';
+import {
+  describeLoopStop,
+  formatInteractiveLoopDetectedMessage,
+} from '../../utils/loop-detected-message.js';
+import type { LoopStop } from '../../utils/loop-detected-message.js';
+import {
+  LoopReason,
+  LoopType,
+} from '@qwen-code/qwen-code-core/telemetry/types.js';
 import { cleanupReviewWorktreeLeases } from '../../services/review-worktree-lease.js';
 import {
   getInlineImageData,
@@ -155,6 +184,7 @@ interface TeammateQueueEntry {
 }
 
 interface ToolContinuationOwner {
+  restoreResponseBinding?: RestoreToolResponseBinding;
   promptId: string;
   signal: AbortSignal;
   survivesGenerationChange: boolean;
@@ -218,6 +248,25 @@ interface GoalTurnBinding {
 }
 
 type GoalTurnAdmission = Omit<GoalTurnBinding, 'permit'>;
+
+interface ForegroundModTurn {
+  turn: ModTurn;
+  promptId: string;
+  ending?: 'aborted' | 'error';
+  // Ends the turn's turn.start hooks, whichever round the cancel ends.
+  cancel: AbortController;
+}
+
+// Records how the Mod turn of `promptId` ended; the first ending stands.
+function recordModTurnEnding(
+  modTurn: ForegroundModTurn | null,
+  promptId: string | undefined,
+  ending: 'aborted' | 'error',
+): void {
+  if (!modTurn || modTurn.promptId !== promptId) return;
+  modTurn.ending ??= ending;
+  if (ending === 'aborted') modTurn.cancel.abort();
+}
 
 function sameGoalPermit(left: GoalTurnPermit, right: GoalTurnPermit): boolean {
   return (
@@ -414,6 +463,44 @@ const LOADING_THOUGHT_DESCRIPTION_MAX_CHARS = 4_096;
  */
 export const INTERIM_MONITOR_MIN_TURN_INTERVAL_MS = 10_000;
 
+/**
+ * An overflow summary taken from the tally and awaiting a turn to carry it.
+ * `displayed` mirrors the per-notification flag so a re-queued summary is not
+ * rendered twice.
+ */
+interface PendingDroppedSummary {
+  displayText: string;
+  modelText: string;
+  status: 'dropped' | 'recorded';
+  displayed?: boolean;
+}
+
+/**
+ * One entry in the unified notification queue. `kind`, `taskId` and `interim`
+ * feed the shared admission rule and name what was lost when overflow discards
+ * an entry; `monitor` stays separate because the drain also uses it to prune
+ * pulses from monitors that were cancelled while queued.
+ */
+interface QueuedNotification {
+  displayText: string;
+  modelText: string;
+  sendMessageType: SendMessageType;
+  kind: BackgroundNotificationKind;
+  taskId?: string;
+  interim?: boolean;
+  monitor?: { id: string; status: string };
+  todoWorkChainId?: string;
+  onDelivered?: () => void;
+  onDeliveryFailed?: () => void;
+  displayed?: boolean;
+}
+
+function isProtectedNotification(item: QueuedNotification): boolean {
+  return (
+    item.kind === 'agent' || item.kind === 'workflow' || item.kind === 'cron'
+  );
+}
+
 type BufferedStreamEvent =
   | { kind: 'content'; value: string }
   | { kind: 'image'; value: InlineImageData }
@@ -475,6 +562,11 @@ export interface CancelSubmitInfo {
     id: number;
     text: string;
     submittedPrompt?: string;
+    humanInput?: HumanPromptInput;
+    hasUnknownInput?: boolean;
+    pasteExpansions?: ReadonlyMap<string, string>;
+    /** Prompt as sent to the model, when it differed from `text`. */
+    modelText?: string;
   } | null;
   /**
    * Whether removing the Logger's latest USER entry can only target
@@ -514,6 +606,11 @@ export const useLlmStream = (
   onDebugMessage: (message: string) => void,
   handleSlashCommand: (
     cmd: PartListUnion,
+    oneTimeShellAllowlist?: Set<string>,
+    overwriteConfirmed?: boolean,
+    existingInvocationItemId?: number,
+    invocationPromptId?: string,
+    isCurrentSubmission?: () => boolean,
   ) => Promise<SlashCommandProcessorResult | false>,
   shellModeActive: boolean,
   getPreferredEditor: () => EditorType | undefined,
@@ -550,6 +647,9 @@ export const useLlmStream = (
     onSubmissionSettled?: () => void;
   } | null>,
 ) => {
+  const [workflowKeywordActive, setWorkflowKeywordActive] = useState(false);
+  const workflowConfigRef = useRef(config);
+  workflowConfigRef.current = config;
   const [initError, setInitError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeInteractionPromptIdRef = useRef<string | undefined>(undefined);
@@ -605,7 +705,11 @@ export const useLlmStream = (
     }
   }, []);
   const failClosedGoalTurn = useCallback(
-    async (binding: GoalTurnBinding, reason: string): Promise<void> => {
+    async (
+      binding: GoalTurnBinding,
+      reason: string,
+      options?: { userCancelled?: boolean; pauseReason?: string },
+    ): Promise<void> => {
       if (!binding.controller.signal.aborted) {
         binding.controller.abort(reason);
       }
@@ -626,6 +730,17 @@ export const useLlmStream = (
               action: 'pause',
               expectedGoalId: binding.permit.goalId,
               expectedRevision: binding.permit.revision,
+              // `reason` is the abort cause, which sibling hosts compare
+              // against sentinel constants and which the debug log wants
+              // verbatim. It is a scheduler diagnostic, so it never reaches
+              // the durable user-facing reason: a caller that has a sentence
+              // for the reader passes it as `pauseReason`, and everything
+              // else falls back to the builder's detail-free wording.
+              reason:
+                options?.pauseReason ??
+                (options?.userCancelled
+                  ? GOAL_PAUSE_REASON_USER_INTERRUPT
+                  : goalPauseReasonForFailure('')),
             });
           } catch (error) {
             debugLogger.warn('Failed to pause invalid Goal tool batch', error);
@@ -761,6 +876,11 @@ export const useLlmStream = (
     id: number;
     text: string;
     submittedPrompt?: string;
+    humanInput?: HumanPromptInput;
+    hasUnknownInput?: boolean;
+    pasteExpansions?: ReadonlyMap<string, string>;
+    /** Prompt as sent to the model, when it differed from `text`. */
+    modelText?: string;
   } | null>(null);
   const canUndoLastLoggedUserMessageRef = useRef(false);
   // Set to true the first time a content event lands this turn — even
@@ -871,10 +991,18 @@ export const useLlmStream = (
   // before submitQuery installs the next turn controller.
   // cancelOngoingRequest aborts these controllers so Ctrl+C still cancels them.
   const auxiliaryAbortRefsRef = useRef<Set<AbortController>>(new Set());
+  // The Mods hear the foreground turn from its admission until the stream
+  // goes idle; a cancel or a failure on the way records how it ended.
+  const modTurnRef = useRef<ForegroundModTurn | null>(null);
+  // Whether the quiet cancel `$.turn.abort` asked for ended anything.
+  const cancelForModRef = useRef<() => boolean>(() => false);
+  const quietCancelRef = useRef(false);
+  // A turn whose stream ends at once may never render as Responding.
+  const [modTurnId, setModTurnId] = useState<string>();
   const [pendingHistoryItem, pendingHistoryItemRef, setPendingHistoryItem] =
     useStateAndRef<HistoryItemWithoutId | null>(null);
   // Mixed assistant output needs multiple live rows to preserve
-  // text/image/text ordering. Keep completed runs in the dynamic region until
+  // text/image/reasoning ordering. Keep completed runs in the dynamic region until
   // the response reaches a normal commit boundary so a fresh retry or model
   // fallback can still discard the entire failed attempt.
   const [
@@ -912,11 +1040,71 @@ export const useLlmStream = (
     return true;
   }, [pendingHistoryItemRef, setPendingAssistantItems, setPendingHistoryItem]);
   // Streamed model reasoning for the current turn. Rendered (height-limited)
-  // above the answer while thinking, then committed to history as a
-  // collapsible `gemini_thought` block when the answer/tool/turn begins.
+  // after preceding assistant output, then stored as a collapsible
+  // `gemini_thought` block when the next answer/tool/turn begins.
   const [pendingThoughtItem, pendingThoughtItemRef, setPendingThoughtItem] =
     useStateAndRef<HistoryItemWithoutId | null>(null);
   const thoughtStartTimeRef = useRef<number | null>(null);
+  const thoughtGroupIdRef = useRef<number | undefined>(undefined);
+  const lastThoughtGroupIdRef = useRef(0);
+  // Commit the streamed reasoning to history as a collapsible block (or drop
+  // it). Called when the answer/tool/turn begins, or on cancel/error.
+  const commitPendingThought = useCallback(
+    (userMessageTimestamp: number, deferForInterleaving = false) => {
+      const pendingThought = pendingThoughtItemRef.current;
+      if (
+        (pendingThought?.type === 'gemini_thought' ||
+          pendingThought?.type === 'gemini_thought_content') &&
+        pendingThought.thoughtGroupId !== undefined
+      ) {
+        setPendingAssistantItems((items) =>
+          items.map((item) =>
+            (item.type === 'gemini_thought' ||
+              item.type === 'gemini_thought_content') &&
+            item.thoughtGroupId === pendingThought.thoughtGroupId
+              ? { ...item, isStreaming: false }
+              : item,
+          ),
+        );
+      }
+      if (!deferForInterleaving) {
+        commitPendingAssistantItems(userMessageTimestamp);
+      }
+      if (pendingThought) {
+        const item = { ...pendingThought };
+        if (
+          (item.type === 'gemini_thought' ||
+            item.type === 'gemini_thought_content') &&
+          item.thoughtGroupId !== undefined
+        ) {
+          item.isStreaming = false;
+        }
+        if (item.type === 'gemini_thought' && thoughtStartTimeRef.current) {
+          item.durationMs = Date.now() - thoughtStartTimeRef.current;
+        }
+        if (
+          deferForInterleaving &&
+          pendingAssistantItemsRef.current.length > 0
+        ) {
+          setPendingAssistantItems((items) => [...items, item]);
+        } else {
+          addItem(item, userMessageTimestamp);
+        }
+      }
+      setPendingThoughtItem(null);
+      thoughtStartTimeRef.current = null;
+      thoughtGroupIdRef.current = undefined;
+    },
+    [
+      addItem,
+      pendingThoughtItemRef,
+      setPendingThoughtItem,
+      commitPendingAssistantItems,
+      pendingAssistantItemsRef,
+      setPendingAssistantItems,
+    ],
+  );
+
   const [
     pendingRetryErrorItem,
     pendingRetryErrorItemRef,
@@ -928,6 +1116,7 @@ export const useLlmStream = (
     setPendingRetryCountdownItem,
   ] = useStateAndRef<HistoryItemWithoutId | null>(null);
   const clearPendingState = useCallback(() => {
+    setWorkflowKeywordActive(false);
     setPendingAssistantItems([]);
     setPendingHistoryItem(null);
     setPendingRetryErrorItem(null);
@@ -1089,6 +1278,12 @@ export const useLlmStream = (
       getPreferredEditor,
       onEditorClose,
       canUseToolResultFullTurnModel,
+      (call) =>
+        observeInteractiveModTool(
+          config,
+          call,
+          refreshContextFilesOnWriteRef.current,
+        ),
     );
 
   const pendingToolCallGroupDisplay = useMemo(() => {
@@ -1113,12 +1308,13 @@ export const useLlmStream = (
   }, [toolCalls]);
 
   const loopDetectedRef = useRef(false);
+  // Type and reason of the stop behind loopDetectedRef, for the dialog and
+  // the message after it.
+  const loopStopRef = useRef<LoopStop | undefined>(undefined);
   const [
     loopDetectionConfirmationRequest,
     setLoopDetectionConfirmationRequest,
-  ] = useState<{
-    onComplete: (result: { userSelection: 'disable' | 'keep' }) => void;
-  } | null>(null);
+  ] = useState<LoopDetectionConfirmationRequest | null>(null);
 
   const stopRetryCountdownTimer = useCallback(() => {
     if (retryCountdownTimerRef.current) {
@@ -1198,11 +1394,31 @@ export const useLlmStream = (
 
   useEffect(() => () => stopRetryCountdownTimer(), [stopRetryCountdownTimer]);
 
-  const onExec = useCallback(async (done: Promise<void>) => {
-    setIsResponding(true);
-    await done;
-    setIsResponding(false);
-  }, []);
+  const onExec = useCallback(
+    async (done: Promise<void>) => {
+      const shellAbortController = abortControllerRef.current;
+      if (shellAbortController) {
+        detachedToolContinuationAbortControllersRef.current.add(
+          shellAbortController,
+        );
+      }
+      const releaseShellActivity = retainSubmissionActivity(
+        submissionLeaseGenerationRef.current,
+      );
+      setIsResponding(true);
+      try {
+        await done;
+      } finally {
+        if (shellAbortController) {
+          detachedToolContinuationAbortControllersRef.current.delete(
+            shellAbortController,
+          );
+        }
+        releaseShellActivity();
+      }
+    },
+    [retainSubmissionActivity],
+  );
   const { handleShellCommand, activeShellPtyId } = useShellCommandProcessor(
     addItem,
     setPendingHistoryItem,
@@ -1264,6 +1480,21 @@ export const useLlmStream = (
   }, [isResponding, toolCalls]);
 
   useEffect(() => {
+    if (streamingState === StreamingState.Idle) setWorkflowKeywordActive(false);
+  }, [streamingState]);
+  const finishModTurn = useCallback(() => {
+    const current = modTurnRef.current;
+    modTurnRef.current = null;
+    void current?.turn.complete(current.ending);
+  }, []);
+  useEffect(() => {
+    if (streamingState === StreamingState.Idle) finishModTurn();
+  }, [streamingState, modTurnId, finishModTurn]);
+  useEffect(() => {
+    setWorkflowKeywordActive(false);
+  }, [config, sessionStates.sessionId]);
+
+  useEffect(() => {
     if (
       config.getApprovalMode() === ApprovalMode.YOLO &&
       streamingState === StreamingState.Idle
@@ -1282,16 +1513,32 @@ export const useLlmStream = (
     }
   }, [streamingState, config, history]);
 
-  const cancelOngoingRequest = useCallback(() => {
+  const cancelOngoingRequest = useCallback((): boolean => {
+    // Set for one call by `$.turn.abort`: the same cancel, without its
+    // notice, the loop stop or the composer restore.
+    const quiet = quietCancelRef.current;
+    quietCancelRef.current = false;
+    setWorkflowKeywordActive(false);
     if (turnCancelledRef.current) {
       for (const controller of detachedToolContinuationAbortControllersRef.current) {
         controller.abort();
       }
       detachedToolContinuationAbortControllersRef.current.clear();
-      return;
+      return false;
     }
-    if (streamingState !== StreamingState.Responding) {
-      return;
+    // A Mod can end its turn before React renders the turn's admission:
+    // the turn and the stream it opened already count.
+    if (
+      quiet
+        ? streamingState === StreamingState.Idle &&
+          !(modTurnRef.current && activeModelStreamsRef.current > 0)
+        : streamingState !== StreamingState.Responding
+    ) {
+      return false;
+    }
+    if (modTurnRef.current) {
+      modTurnRef.current.ending = 'aborted';
+      modTurnRef.current.cancel.abort();
     }
     // Flush throttled stream chunks FIRST so anything sitting in the
     // per-turn bufferedEvents lands on `pendingHistoryItemRef.current`
@@ -1342,8 +1589,9 @@ export const useLlmStream = (
     // wakeups so the loop doesn't resume after the cancelled tick. Only clears
     // session wakeups (never cron jobs); lazily-creating an empty scheduler
     // here is inert.
-    const loopWakeupsCancelled =
-      config.getCronScheduler()?.cancelAllWakeups() ?? 0;
+    const loopWakeupsCancelled = quiet
+      ? 0
+      : (config.getCronScheduler()?.cancelAllWakeups() ?? 0);
     // Cancel any in-flight auxiliary work so its Promise.then doesn't add
     // stale content after the user cancelled.
     for (const ac of auxiliaryAbortRefsRef.current) {
@@ -1367,16 +1615,19 @@ export const useLlmStream = (
     );
     logApiCancel(config, cancellationEvent);
 
+    commitPendingThought(Date.now());
     if (pendingHistoryItemRef.current) {
       commitItemInOrder(pendingHistoryItemRef.current, Date.now());
     }
-    addItem(
-      {
-        type: MessageType.INFO,
-        text: 'Request cancelled.',
-      },
-      Date.now(),
-    );
+    if (!quiet) {
+      addItem(
+        {
+          type: MessageType.INFO,
+          text: 'Request cancelled.',
+        },
+        Date.now(),
+      );
+    }
     if (loopWakeupsCancelled > 0) {
       addItem(
         {
@@ -1405,21 +1656,24 @@ export const useLlmStream = (
     // either move the auto-restore check to read functional setState
     // or revisit isSyntheticHistoryItem.
     try {
-      onCancelSubmit({
-        pendingItem: pendingItemAtCancel,
-        lastTurnUserItem: lastTurnUserItemRef.current,
-        canUndoLastLoggedUserMessage: canUndoLastLoggedUserMessageRef.current,
-        turnProducedMeaningfulContent: turnSawContentEventRef.current,
-        wasGoalTurn: activeGoalTurnRef.current !== null,
-      });
+      if (!quiet)
+        onCancelSubmit({
+          pendingItem: pendingItemAtCancel,
+          lastTurnUserItem: lastTurnUserItemRef.current,
+          canUndoLastLoggedUserMessage: canUndoLastLoggedUserMessageRef.current,
+          turnProducedMeaningfulContent: turnSawContentEventRef.current,
+          wasGoalTurn: activeGoalTurnRef.current !== null,
+        });
     } finally {
       setIsResponding(false);
       setShellInputFocused(false);
     }
+    return true;
   }, [
     streamingState,
     addItem,
     commitItemInOrder,
+    commitPendingThought,
     setPendingHistoryItem,
     onCancelSubmit,
     pendingHistoryItemRef,
@@ -1429,6 +1683,16 @@ export const useLlmStream = (
     getPromptCount,
     setSubmissionInFlight,
   ]);
+  // `$.turn.abort` arrives from the Mod worker, outside any render.
+  useLayoutEffect(() => {
+    cancelForModRef.current = () => {
+      // A turn already cancelled is not the Mod's to end; a second cancel
+      // would also abort the detached work the first one spared.
+      if (turnCancelledRef.current) return false;
+      quietCancelRef.current = true;
+      return cancelOngoingRequest();
+    };
+  }, [cancelOngoingRequest]);
 
   const applyVisionBridgeIfNeeded = useCallback(
     async (
@@ -1524,10 +1788,19 @@ export const useLlmStream = (
       submitType: SendMessageType,
       submittedPrompt: string | undefined,
       preserveTurnOwnership: boolean,
+      shellModeIntent?: boolean,
+      displayText?: string,
+      humanInput?: HumanPromptInput,
+      pasteExpansions?: ReadonlyMap<string, string>,
+      hasUnknownInput?: boolean,
+      isCurrentSubmission?: () => boolean,
     ): Promise<{
       queryToSend: PartListUnion | null;
       shouldProceed: boolean;
-      scheduledToolCallId?: string;
+      scheduledClientTool?: {
+        request: ToolCallRequestInfo;
+        restoreResponseBinding?: RestoreToolResponseBinding;
+      };
     }> => {
       if (turnCancelledRef.current && !preserveTurnOwnership) {
         return { queryToSend: null, shouldProceed: false };
@@ -1576,13 +1849,38 @@ export const useLlmStream = (
         }
 
         onDebugMessage(`Received user query (${trimmedQuery.length} chars)`);
-        await logger?.logMessage(MessageSenderType.USER, trimmedQuery);
+        // Handle UI-only commands first
+        const isSlash = isSlashCommand(trimmedQuery);
+        // One-shot notices the TUI folded into this prompt stay on the model
+        // side only: the recall log, the transcript row and the cancel-restore
+        // buffer use the composer's projection (#11553), since reverse-parsing
+        // cannot tell an injected envelope from one the user typed. The strip
+        // is the fallback for producers outside this process; slash commands
+        // keep their own text. Logged before the slash and shell arms can
+        // return, so handled commands stay recallable.
+        const userText =
+          displayText ??
+          submittedPrompt ??
+          (isSlash ? trimmedQuery : stripLeadingSystemReminders(trimmedQuery));
+        const recallText = pasteExpansions?.size
+          ? expandPendingPastePlaceholders(userText, pasteExpansions)
+          : userText;
+        await logger?.logMessage(MessageSenderType.USER, recallText);
+        if (abortSignal.aborted) {
+          return { queryToSend: null, shouldProceed: false };
+        }
         canUndoLastLoggedUserMessageRef.current =
           !preserveTurnOwnership && logger != null;
 
-        // Handle UI-only commands first
-        const slashCommandResult = isSlashCommand(trimmedQuery)
-          ? await handleSlashCommand(trimmedQuery)
+        const slashCommandResult = isSlash
+          ? await handleSlashCommand(
+              trimmedQuery,
+              undefined,
+              undefined,
+              undefined,
+              submitType === SendMessageType.UserQuery ? prompt_id : undefined,
+              isCurrentSubmission,
+            )
           : false;
 
         if (slashCommandResult) {
@@ -1595,13 +1893,24 @@ export const useLlmStream = (
                 args: toolArgs,
                 isClientInitiated: true,
                 prompt_id,
+                // Client-direct provenance (omni policy design): slash
+                // commands scheduling a tool are the in-process `client`
+                // channel — subject to the same media-policy modelAccess
+                // gate as model calls, never to fixed-policy semantics.
+                executionOrigin: { kind: 'client' },
               };
-              registerToolBatch(toolCallRequest);
-              scheduleToolCalls([toolCallRequest], abortSignal);
               return {
                 queryToSend: null,
                 shouldProceed: false,
-                scheduledToolCallId: toolCallRequest.callId,
+                scheduledClientTool: {
+                  request: toolCallRequest,
+                  ...(slashCommandResult.restoreResponseBinding
+                    ? {
+                        restoreResponseBinding:
+                          slashCommandResult.restoreResponseBinding,
+                      }
+                    : {}),
+                },
               };
             }
             case 'submit_prompt': {
@@ -1666,7 +1975,12 @@ export const useLlmStream = (
           }
         }
 
-        if (shellModeActive && handleShellCommand(trimmedQuery, abortSignal)) {
+        // A queued submission carries the shell intent recorded when the
+        // user submitted it; the live flag may have flipped while the
+        // entry waited in the queue (#11626). Other producers record no
+        // intent and route on the live flag, as before.
+        const routeToShell = shellModeIntent ?? shellModeActive;
+        if (routeToShell && handleShellCommand(trimmedQuery, abortSignal)) {
           return { queryToSend: null, shouldProceed: false };
         }
 
@@ -1681,8 +1995,12 @@ export const useLlmStream = (
           const insertedId = addItem(
             {
               type: MessageType.USER,
-              text: trimmedQuery,
+              text: userText,
+              ...(recallText !== userText ? { recallText } : {}),
               promptId: prompt_id,
+              // The envelope masked a leading `?` from the lexical fallback in
+              // isRealUserTurn; an un-noticed prompt keeps that fallback.
+              ...(userText === trimmedQuery ? {} : { sentToModel: true }),
             } as HistoryItemWithoutId,
             userMessageTimestamp,
           );
@@ -1694,8 +2012,14 @@ export const useLlmStream = (
           if (!preserveTurnOwnership) {
             lastTurnUserItemRef.current = {
               id: insertedId,
-              text: trimmedQuery,
+              text: userText,
               ...(submittedPrompt === undefined ? {} : { submittedPrompt }),
+              ...(humanInput === undefined ? {} : { humanInput }),
+              ...(pasteExpansions?.size ? { pasteExpansions } : {}),
+              ...(hasUnknownInput ? { hasUnknownInput } : {}),
+              // What the model actually read, so a cancel + resubmit does not
+              // drop the one-shot notice this turn consumed.
+              ...(userText === trimmedQuery ? {} : { modelText: trimmedQuery }),
             };
           }
 
@@ -1759,8 +2083,6 @@ export const useLlmStream = (
       handleSlashCommand,
       logger,
       shellModeActive,
-      registerToolBatch,
-      scheduleToolCalls,
       applyVisionBridgeIfNeeded,
     ],
   );
@@ -2063,6 +2385,23 @@ export const useLlmStream = (
       if (startingNewThought) {
         thoughtStartTimeRef.current = Date.now();
         newThoughtBuffer = description;
+        thoughtGroupIdRef.current = undefined;
+        if (pendingAssistantItemsRef.current.length > 0) {
+          // Keep fold identity across retries, new turns, and the history commit.
+          for (const item of historyRef.current) {
+            if (
+              (item.type === 'gemini_thought' ||
+                item.type === 'gemini_thought_content') &&
+              item.thoughtGroupId !== undefined
+            ) {
+              lastThoughtGroupIdRef.current = Math.min(
+                lastThoughtGroupIdRef.current,
+                item.thoughtGroupId,
+              );
+            }
+          }
+          thoughtGroupIdRef.current = --lastThoughtGroupIdRef.current;
+        }
       }
 
       // Keep the transient `thought` (subject) in sync for the window title.
@@ -2087,17 +2426,16 @@ export const useLlmStream = (
       const buildThoughtItem = (
         type: 'gemini_thought' | 'gemini_thought_content',
         text: string,
-      ): HistoryItemWithoutId =>
-        type === 'gemini_thought'
-          ? {
-              type,
-              text,
-              durationMs: getThoughtDurationMs(),
-            }
-          : {
-              type,
-              text,
-            };
+      ): HistoryItemWithoutId => ({
+        type,
+        text,
+        ...(type === 'gemini_thought'
+          ? { durationMs: getThoughtDurationMs() }
+          : {}),
+        ...(thoughtGroupIdRef.current !== undefined
+          ? { thoughtGroupId: thoughtGroupIdRef.current, isStreaming: true }
+          : {}),
+      });
 
       let splitPoint = findLastSafeSplitPoint(
         newThoughtBuffer,
@@ -2114,10 +2452,12 @@ export const useLlmStream = (
           newThoughtBuffer,
           safeSplitPoint,
         );
-        addItem(
-          buildThoughtItem(pendingThoughtType, beforeText),
-          userMessageTimestamp,
-        );
+        const item = buildThoughtItem(pendingThoughtType, beforeText);
+        if (pendingAssistantItemsRef.current.length > 0) {
+          setPendingAssistantItems((items) => [...items, item]);
+        } else {
+          addItem(item, userMessageTimestamp);
+        }
         pendingThoughtType = 'gemini_thought_content';
         newThoughtBuffer = afterText;
         splitPoint = findLastSafeSplitPoint(
@@ -2132,24 +2472,14 @@ export const useLlmStream = (
 
       return newThoughtBuffer;
     },
-    [addItem, mergeThought, pendingThoughtItemRef, setPendingThoughtItem],
-  );
-
-  // Commit the streamed reasoning to history as a collapsible block (or drop
-  // it). Called when the answer/tool/turn begins, or on cancel/error.
-  const commitPendingThought = useCallback(
-    (userMessageTimestamp: number) => {
-      if (pendingThoughtItemRef.current) {
-        const item = { ...pendingThoughtItemRef.current };
-        if (item.type === 'gemini_thought' && thoughtStartTimeRef.current) {
-          item.durationMs = Date.now() - thoughtStartTimeRef.current;
-        }
-        addItem(item, userMessageTimestamp);
-      }
-      setPendingThoughtItem(null);
-      thoughtStartTimeRef.current = null;
-    },
-    [addItem, pendingThoughtItemRef, setPendingThoughtItem],
+    [
+      addItem,
+      mergeThought,
+      pendingThoughtItemRef,
+      setPendingThoughtItem,
+      pendingAssistantItemsRef,
+      setPendingAssistantItems,
+    ],
   );
 
   const handleUserCancelledEvent = useCallback(
@@ -2208,7 +2538,9 @@ export const useLlmStream = (
       eventValue: LlmErrorEventValue,
       userMessageTimestamp: number,
       submitType: SendMessageType,
+      ownsTurn: boolean,
     ) => {
+      if (ownsTurn) setWorkflowKeywordActive(false);
       if (submitType !== SendMessageType.Goal) {
         lastPromptErroredRef.current = true;
       } else {
@@ -2431,7 +2763,10 @@ export const useLlmStream = (
   );
 
   const handleLoopDetectionConfirmation = useCallback(
-    (result: { userSelection: 'disable' | 'keep' }) => {
+    (
+      result: { userSelection: 'disable' | 'keep' },
+      stop: LoopStop | undefined,
+    ) => {
       setLoopDetectionConfirmationRequest(null);
 
       if (result.userSelection === 'disable') {
@@ -2447,7 +2782,7 @@ export const useLlmStream = (
         addItem(
           {
             type: 'info',
-            text: `A potential loop was detected. This can happen due to repetitive tool calls or other model behavior. The request has been halted.`,
+            text: formatInteractiveLoopDetectedMessage(stop),
           },
           Date.now(),
         );
@@ -2456,12 +2791,16 @@ export const useLlmStream = (
     [config, addItem],
   );
 
-  const handleLoopDetectedEvent = useCallback(() => {
-    // Show the confirmation dialog to choose whether to disable loop detection
-    setLoopDetectionConfirmationRequest({
-      onComplete: handleLoopDetectionConfirmation,
-    });
-  }, [handleLoopDetectionConfirmation]);
+  const handleLoopDetectedEvent = useCallback(
+    (stop: LoopStop | undefined) => {
+      // Show the confirmation dialog to choose whether to disable loop detection
+      setLoopDetectionConfirmationRequest({
+        cause: describeLoopStop(stop),
+        onComplete: (result) => handleLoopDetectionConfirmation(result, stop),
+      });
+    },
+    [handleLoopDetectionConfirmation],
+  );
 
   const handleUserPromptSubmitBlockedEvent = useCallback(
     (
@@ -2662,10 +3001,14 @@ export const useLlmStream = (
             }
           }
 
+          const description = thoughtDescriptions.join('');
+          if (description.trim().length > 0 && stagePendingAssistantItem()) {
+            llmMessageBuffer = '';
+          }
           thoughtBuffer = handleThoughtEvent(
             {
               subject,
-              description: thoughtDescriptions.join(''),
+              description,
             },
             thoughtBuffer,
             userMessageTimestamp,
@@ -2694,6 +3037,9 @@ export const useLlmStream = (
             }
           }
           dualOutput?.processEvent(event);
+          const modTurn = modTurnRef.current;
+          if (trackInteractionOwner && modTurn && modTurn.promptId === promptId)
+            modTurn.turn.saw(event);
           switch (event.type) {
             case ServerLlmEventType.Thought:
               // Subject-only chunks are discrete status updates for the
@@ -2720,7 +3066,7 @@ export const useLlmStream = (
                 bufferedEvents.some((e) => e.kind === 'thought')
               ) {
                 flushBufferedStreamEvents();
-                commitPendingThought(userMessageTimestamp);
+                commitPendingThought(userMessageTimestamp, true);
                 thoughtBuffer = '';
               }
               setThought((prev) => (prev ? null : prev));
@@ -2747,7 +3093,7 @@ export const useLlmStream = (
               // reasoning then commit it to history (collapsed) above the tool
               // output.
               flushBufferedStreamEvents();
-              commitPendingThought(userMessageTimestamp);
+              commitPendingThought(userMessageTimestamp, true);
               thoughtBuffer = '';
               setThought((prev) => (prev ? null : prev));
               if (event.value.goalContext && turnAdmission) {
@@ -2778,10 +3124,22 @@ export const useLlmStream = (
               };
             case ServerLlmEventType.Error:
               flushBufferedStreamEvents();
-              handleErrorEvent(event.value, userMessageTimestamp, submitType);
+              handleErrorEvent(
+                event.value,
+                userMessageTimestamp,
+                submitType,
+                trackInteractionOwner &&
+                  toolContinuationOwner?.foregroundAbortController !==
+                    undefined &&
+                  abortControllerRef.current ===
+                    toolContinuationOwner.foregroundAbortController,
+              );
               break;
             case ServerLlmEventType.ChatCompressed:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               handleChatCompressionEvent(event.value, userMessageTimestamp);
               llmMessageBuffer = '';
               assistantOutputStarted = false;
@@ -2790,8 +3148,13 @@ export const useLlmStream = (
             case ServerLlmEventType.ToolCallResponse:
               flushBufferedStreamEvents();
               break;
+            case ServerLlmEventType.ToolCallPreparation:
+              break;
             case ServerLlmEventType.MaxSessionTurns:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               if (pendingHistoryItemRef.current) {
                 commitItemInOrder(
                   pendingHistoryItemRef.current,
@@ -2805,6 +3168,9 @@ export const useLlmStream = (
               break;
             case ServerLlmEventType.SessionTokenLimitExceeded:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               if (pendingHistoryItemRef.current) {
                 commitItemInOrder(
                   pendingHistoryItemRef.current,
@@ -2848,17 +3214,21 @@ export const useLlmStream = (
               break;
             case ServerLlmEventType.Citation:
               flushBufferedStreamEvents();
-              handleCitationEvent(event.value, userMessageTimestamp);
               if (showCitations(settings)) {
+                commitPendingThought(userMessageTimestamp);
+                thoughtBuffer = '';
+                setThought(null);
                 llmMessageBuffer = '';
                 assistantOutputStarted = false;
               }
+              handleCitationEvent(event.value, userMessageTimestamp);
               break;
             case ServerLlmEventType.LoopDetected:
               flushBufferedStreamEvents();
               // handle later because we want to move pending history to history
               // before we add loop detected message to history
               loopDetectedRef.current = true;
+              loopStopRef.current = event.value;
               break;
             case ServerLlmEventType.Retry:
               // On fresh restart (escalation / rate-limit / invalid stream),
@@ -2870,11 +3240,11 @@ export const useLlmStream = (
               // losing the partial text we meant to preserve.
               if (!event.isContinuation) {
                 discardBufferedStreamEvents();
+                commitPendingThought(userMessageTimestamp, true);
                 setPendingAssistantItems([]);
                 if (pendingHistoryItemRef.current) {
                   setPendingHistoryItem(null);
                 }
-                commitPendingThought(userMessageTimestamp);
                 thoughtBuffer = '';
                 setThought(null);
                 llmMessageBuffer = '';
@@ -2903,11 +3273,11 @@ export const useLlmStream = (
               // switching to the next fallback model. Discard partial content
               // from the failed attempt and show a notification.
               discardBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp, true);
               setPendingAssistantItems([]);
               if (pendingHistoryItemRef.current) {
                 setPendingHistoryItem(null);
               }
-              commitPendingThought(userMessageTimestamp);
               thoughtBuffer = '';
               setThought(null);
               llmMessageBuffer = '';
@@ -2929,6 +3299,9 @@ export const useLlmStream = (
             }
             case ServerLlmEventType.HookSystemMessage:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               // Display system message from Stop hooks with "Stop says:" prefix
               // First commit any pending AI response to ensure correct ordering
               if (pendingHistoryItemRef.current) {
@@ -2948,8 +3321,30 @@ export const useLlmStream = (
               llmMessageBuffer = '';
               assistantOutputStarted = false;
               break;
+            case ServerLlmEventType.GoalSettlementFailed:
+              flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
+              if (pendingHistoryItemRef.current) {
+                commitItemInOrder(
+                  pendingHistoryItemRef.current,
+                  userMessageTimestamp,
+                );
+                setPendingHistoryItem(null);
+              }
+              addItem(
+                { type: 'warning', text: event.value },
+                userMessageTimestamp,
+              );
+              llmMessageBuffer = '';
+              assistantOutputStarted = false;
+              break;
             case ServerLlmEventType.UserPromptSubmitBlocked:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               userPromptBlocked = true;
               handleUserPromptSubmitBlockedEvent(
                 event.value,
@@ -2960,15 +3355,19 @@ export const useLlmStream = (
               break;
             case ServerLlmEventType.StopHookLoop:
               flushBufferedStreamEvents();
+              commitPendingThought(userMessageTimestamp);
+              thoughtBuffer = '';
+              setThought(null);
               handleStopHookLoopEvent(event.value, userMessageTimestamp);
               llmMessageBuffer = '';
               assistantOutputStarted = false;
               break;
-            case ServerLlmEventType.ActiveGoal:
-              break;
             case ServerLlmEventType.GoalState:
               if (event.cause && shouldDisplayGoalStateCause(event.cause)) {
                 flushBufferedStreamEvents();
+                commitPendingThought(userMessageTimestamp);
+                thoughtBuffer = '';
+                setThought(null);
                 if (pendingHistoryItemRef.current) {
                   commitItemInOrder(
                     pendingHistoryItemRef.current,
@@ -2997,11 +3396,13 @@ export const useLlmStream = (
         }
       } finally {
         flushBufferedStreamEvents();
-        commitPendingThought(userMessageTimestamp);
+        // A thrown stream must leave interleaved output discardable on retry.
+        commitPendingThought(userMessageTimestamp, true);
         discardBufferedStreamEvents();
         flushBufferedStreamEventsRef.current.delete(flushBufferedStreamEvents);
         dualOutput?.finalizeAssistantMessage();
       }
+      commitPendingAssistantItems(userMessageTimestamp);
       // When a loop was detected, halt without scheduling the calls collected
       // before the guard fired. The core splice/clear only touches
       // turn.pendingToolCalls, which the TUI does not execute from — without
@@ -3060,6 +3461,10 @@ export const useLlmStream = (
             `[processLlmStreamEvents] Dropping batch after repeated duplicate provider tool-call id: ${repeatedDuplicateRequest.providerCallId} (tool: ${repeatedDuplicateRequest.name})`,
           );
           loopDetectedRef.current = true;
+          loopStopRef.current = {
+            loopType: LoopType.GLOBAL_TOOL_CALL_DUPLICATE,
+            loopReason: LoopReason.PROVIDER_DUPLICATE_ID,
+          };
           return {
             status: StreamProcessingStatus.Completed,
             scheduledToolContinuation: false,
@@ -3128,6 +3533,16 @@ export const useLlmStream = (
         }
 
         if (executableToolCallRequests.length > 0) {
+          // The scheduler may complete a fast tool before this stream's caller
+          // regains control. Seal streamed assistant text first so the tool
+          // group cannot enter static history ahead of it.
+          if (pendingHistoryItemRef.current) {
+            commitItemInOrder(
+              pendingHistoryItemRef.current,
+              userMessageTimestamp,
+            );
+            setPendingHistoryItem(null);
+          }
           if (toolContinuationOwner) {
             for (const request of executableToolCallRequests) {
               continuationOwnersByToolCallIdRef.current.set(
@@ -3177,6 +3592,7 @@ export const useLlmStream = (
       clearRetryCountdown,
       setThought,
       commitPendingThought,
+      commitPendingAssistantItems,
       pendingHistoryItemRef,
       pendingAssistantItemsRef,
       pendingThoughtItemRef,
@@ -3215,6 +3631,8 @@ export const useLlmStream = (
         const message = messages[index];
         if (GOAL_COMMAND_RE.test(message)) {
           await handleSlashCommand(message);
+          // The command has already taken effect; restoring it after cancelled
+          // steering preparation would execute that side effect again.
           continue;
         }
 
@@ -3224,11 +3642,24 @@ export const useLlmStream = (
         if (isAtCommand(message)) {
           const timeout = new AbortController();
           const atCommandSignal = AbortSignal.any([signal, timeout.signal]);
-          const timeoutId = setTimeout(() => {
-            timeout.abort(
-              new Error(MID_TURN_AT_COMMAND_RESOLVE_TIMEOUT_MESSAGE),
-            );
-          }, MID_TURN_AT_COMMAND_RESOLVE_TIMEOUT_MS);
+          // URL media refs are exempt from the fixed mid-turn budget: the
+          // omni URL path downloads and uploads media end-to-end inside
+          // resolveAtCommandQuery under its own watchdogs (30s header, 60s
+          // idle), so a 10s cap would structurally kill every mid-turn
+          // @https reference — and inside the resolver the timeout abort is
+          // indistinguishable from a user cancel, so the message would be
+          // dropped quietly rather than failing with a named error.
+          // Filesystem resolution keeps the cap unchanged.
+          const hasUrlMediaRef =
+            /@https?:\/\//i.test(message) &&
+            (config.isOmniEnabled?.() ?? false);
+          const timeoutId = hasUrlMediaRef
+            ? undefined
+            : setTimeout(() => {
+                timeout.abort(
+                  new Error(MID_TURN_AT_COMMAND_RESOLVE_TIMEOUT_MESSAGE),
+                );
+              }, MID_TURN_AT_COMMAND_RESOLVE_TIMEOUT_MS);
           try {
             const atCommandResult = await resolveWithAbort(
               atCommandSignal,
@@ -3444,8 +3875,20 @@ export const useLlmStream = (
         onDeliveryFailed?: () => void;
         onAdmissionFailed?: () => void;
         onGoalClaimDeferred?: () => void;
+        onRequestStarted?: () => void;
         steerInput?: SteerInput;
         submittedPrompt?: string;
+        displayText?: string;
+        humanInput?: HumanPromptInput;
+        hasUnknownInput?: boolean;
+        pasteExpansions?: ReadonlyMap<string, string>;
+        /**
+         * Shell intent recorded when the user submitted this query
+         * (queued submissions carry it from the message queue). When set,
+         * it overrides the live `shellModeActive` flag for shell routing,
+         * so a flip after enqueue cannot misroute the entry (#11626).
+         */
+        shellMode?: boolean;
         goal?: QueuedGoalTurn;
         claimGoalTurn?: () => QueuedGoalTurn | undefined;
         userAdmission?: DirectUserAdmission;
@@ -3453,6 +3896,35 @@ export const useLlmStream = (
         toolContinuationOwner?: ToolContinuationOwner;
       },
     ) => {
+      const mods = getInteractiveModSession(config);
+      const dispatchesSlashCommand =
+        (submitType === SendMessageType.UserQuery ||
+          submitType === SendMessageType.Cron) &&
+        typeof query === 'string' &&
+        isSlashCommand(query.trim());
+      // Whether the Mods started. When they failed, the prompt is refused
+      // with the reason, and the caller releases what it holds.
+      const modsStarted = async (): Promise<boolean> => {
+        try {
+          await mods?.ready;
+          return true;
+        } catch {
+          addItem(
+            {
+              type: MessageType.ERROR,
+              text: 'Mods failed to initialize. Fix the Mod configuration and restart. /help and /quit remain available.',
+            },
+            Date.now(),
+          );
+          await releaseUndeliveredGoalTurn(metadata?.userAdmission?.turnKey);
+          return false;
+        }
+      };
+      if (mods && !dispatchesSlashCommand && !(await modsStarted())) {
+        metadata?.onAdmissionFailed?.();
+        metadata?.onDeliveryFailed?.();
+        return;
+      }
       const allowConcurrentBtwDuringResponse =
         submitType === SendMessageType.UserQuery &&
         streamingState === StreamingState.Responding &&
@@ -3524,6 +3996,7 @@ export const useLlmStream = (
       // continuation never carries a pending loop (a detected loop schedules
       // nothing), so clearing it here is a no-op for those paths.
       loopDetectedRef.current = false;
+      loopStopRef.current = undefined;
 
       // Reset turn-local ownership trackers at the very top of every
       // top-level submit (UserQuery, Retry, Cron, Notification, etc.).
@@ -3682,26 +4155,34 @@ export const useLlmStream = (
 
       const releaseSubmissionActivity =
         retainSubmissionActivity(submissionGeneration);
+      if (
+        submitType === SendMessageType.UserQuery &&
+        !allowConcurrentBtwDuringResponse &&
+        !isDetachedToolContinuation
+      ) {
+        // Media preparation can upload before the model stream starts.
+        // Submission activity owns clearing this state on every exit path.
+        setIsResponding(true);
+      }
       const submission = promptIdContext.run(prompt_id, async () => {
         let queuedGoal = metadata?.goal;
         let preparedQuery: {
           queryToSend: PartListUnion | null;
           shouldProceed: boolean;
-          scheduledToolCallId?: string;
+          scheduledClientTool?: {
+            request: ToolCallRequestInfo;
+            restoreResponseBinding?: RestoreToolResponseBinding;
+          };
         };
         try {
           preparedQuery =
             submitType === SendMessageType.Goal
               ? queuedGoal
                 ? {
-                    queryToSend: renderGoalContinuationPrompt({
-                      goalId: queuedGoal.permit.goalId,
-                      revision: queuedGoal.permit.revision,
-                      objective: queuedGoal.continuationContext,
-                      objectiveUpdated: queuedGoal.objectiveUpdated,
-                      windDown: queuedGoal.windDown,
-                      verifierFeedback: queuedGoal.verifierFeedback,
-                    }),
+                    queryToSend: renderGoalContinuationTurn(
+                      queuedGoal,
+                      config.getToolRegistry?.(),
+                    ),
                     shouldProceed: true,
                   }
                 : { queryToSend: null, shouldProceed: false }
@@ -3716,6 +4197,21 @@ export const useLlmStream = (
                     submittedPrompt,
                     allowConcurrentBtwDuringResponse ||
                       isDetachedToolContinuation,
+                    metadata?.shellMode,
+                    metadata?.displayText,
+                    metadata?.humanInput,
+                    metadata?.pasteExpansions,
+                    metadata?.hasUnknownInput,
+                    () =>
+                      streamingState === StreamingState.Idle &&
+                      workflowConfigRef.current === config &&
+                      !abortSignal.aborted &&
+                      foregroundAbortController !== undefined &&
+                      abortControllerRef.current ===
+                        foregroundAbortController &&
+                      submissionGeneration ===
+                        submissionLeaseGenerationRef.current &&
+                      activeModelStreamsRef.current === 0,
                   );
         } catch (error) {
           await releaseUndeliveredGoalTurn(metadata?.userAdmission?.turnKey);
@@ -3723,21 +4219,46 @@ export const useLlmStream = (
           metadata?.onAdmissionFailed?.();
           throw error;
         }
-        const { queryToSend, shouldProceed, scheduledToolCallId } =
+        const { queryToSend, shouldProceed, scheduledClientTool } =
           preparedQuery;
 
-        if (scheduledToolCallId && foregroundAbortController) {
+        if (scheduledClientTool && foregroundAbortController) {
+          if (scheduledClientTool.restoreResponseBinding) {
+            scheduledClientTool.restoreResponseBinding.executionCallId =
+              scheduledClientTool.request.callId;
+          }
           keepToolContinuationAbortController = true;
-          continuationOwnersByToolCallIdRef.current.set(scheduledToolCallId, {
-            promptId: prompt_id!,
-            signal: abortSignal,
-            survivesGenerationChange: false,
-            foregroundAbortController,
-          });
+          continuationOwnersByToolCallIdRef.current.set(
+            scheduledClientTool.request.callId,
+            {
+              ...(scheduledClientTool.restoreResponseBinding
+                ? {
+                    restoreResponseBinding:
+                      scheduledClientTool.restoreResponseBinding,
+                  }
+                : {}),
+              promptId: prompt_id!,
+              signal: abortSignal,
+              survivesGenerationChange: false,
+              foregroundAbortController,
+            },
+          );
+        }
+
+        if (scheduledClientTool) {
+          registerToolBatch(scheduledClientTool.request);
+          scheduleToolCalls([scheduledClientTool.request], abortSignal);
         }
 
         if (!shouldProceed || queryToSend === null) {
           await releaseUndeliveredGoalTurn(metadata?.userAdmission?.turnKey);
+          releaseSubmissionLease();
+          metadata?.onDeliveryFailed?.();
+          return;
+        }
+        // A slash command that reaches the model waits for the Mods as a
+        // typed prompt does.
+        if (mods && dispatchesSlashCommand && !(await modsStarted())) {
           releaseSubmissionLease();
           metadata?.onDeliveryFailed?.();
           return;
@@ -3921,8 +4442,54 @@ export const useLlmStream = (
             dualOutput.emitUserMessage(userParts);
           }
 
+          const workflowSessionId = config.getSessionId();
+          const workflowModeEligible =
+            submitType === SendMessageType.UserQuery &&
+            !allowConcurrentBtwDuringResponse &&
+            !isDetachedToolContinuation &&
+            !(metadata?.shellMode ?? shellModeActive) &&
+            !dispatchesSlashCommand &&
+            !(typeof query === 'string' && isBtwCommand(query));
+          const humanInput = workflowModeEligible
+            ? metadata?.humanInput
+            : undefined;
+          // A prompt the person submitted or retried is a turn the Mods hear.
+          const startsModTurn =
+            mods !== undefined &&
+            !isTurnContinuation &&
+            !allowConcurrentBtwDuringResponse &&
+            !isDetachedToolContinuation &&
+            (submitType === SendMessageType.UserQuery ||
+              submitType === SendMessageType.Retry);
           const sendOptions = {
             type: submitType,
+            ...(workflowModeEligible ? { workflowModeEligible: true } : {}),
+            ...(startsModTurn
+              ? {
+                  onPromptAdmitted: () => {
+                    // One the stream never left idle for ends first.
+                    finishModTurn();
+                    // Each tool round has its own controller; this one
+                    // spans the turn.
+                    const cancel = new AbortController();
+                    // A retry has no typed prompt. A prompt whose composer
+                    // provenance was lost is heard as it is sent.
+                    const turn = mods?.startTurn(
+                      submitType === SendMessageType.Retry
+                        ? ''
+                        : (metadata?.humanInput?.text ??
+                            submittedPrompt ??
+                            (typeof query === 'string' ? query : '')),
+                      AbortSignal.any([abortSignal, cancel.signal]),
+                      () => cancelForModRef.current(),
+                      prompt_id,
+                    );
+                    if (!turn) return;
+                    modTurnRef.current = { turn, promptId: prompt_id!, cancel };
+                    setModTurnId(turn.id);
+                  },
+                }
+              : {}),
             notificationDisplayText: metadata?.notificationDisplayText,
             todoWorkChainId: metadata?.todoWorkChainId,
             modelOverride: modelOverrideRef.current,
@@ -3931,6 +4498,25 @@ export const useLlmStream = (
               ? { isConcurrentSideQuery: true }
               : {}),
             ...(submittedPrompt !== undefined ? { submittedPrompt } : {}),
+            ...(humanInput === undefined
+              ? {}
+              : {
+                  humanInput,
+                  onWorkflowIntentApplied: () => {
+                    if (
+                      workflowConfigRef.current === config &&
+                      !abortSignal.aborted &&
+                      foregroundAbortController !== undefined &&
+                      abortControllerRef.current ===
+                        foregroundAbortController &&
+                      submissionGeneration ===
+                        submissionLeaseGenerationRef.current &&
+                      config.getSessionId() === workflowSessionId
+                    ) {
+                      setWorkflowKeywordActive(true);
+                    }
+                  },
+                }),
             ...(!allowConcurrentBtwDuringResponse &&
             !isDetachedToolContinuation &&
             midTurnDrainRef
@@ -3973,6 +4559,7 @@ export const useLlmStream = (
                   : {}),
             },
           );
+          metadata?.onRequestStarted?.();
 
           const processingResult = await processLlmStreamEvents(
             stream,
@@ -4002,6 +4589,8 @@ export const useLlmStream = (
           ) {
             cleanupReviewLease = true;
             submitPromptOnCompleteRef.current = null;
+            // A Goal preemption cancels the turn without an Esc.
+            recordModTurnEnding(modTurnRef.current, prompt_id, 'aborted');
             metadata?.onDeliveryFailed?.();
             return;
           }
@@ -4059,7 +4648,10 @@ export const useLlmStream = (
                     errorType: response.errorType,
                     executionStatus: response.executionStatus,
                   },
-                  goalToolResultProvenance(request),
+                  goalToolResultProvenance(
+                    request,
+                    finalized[index].responseParts,
+                  ),
                 );
               },
             );
@@ -4100,9 +4692,12 @@ export const useLlmStream = (
           }
           const loopDetected = loopDetectedRef.current;
           if (loopDetected) {
+            recordModTurnEnding(modTurnRef.current, prompt_id, 'error');
             cleanupReviewLease = true;
             loopDetectedRef.current = false;
-            handleLoopDetectedEvent();
+            const loopStop = loopStopRef.current;
+            loopStopRef.current = undefined;
+            handleLoopDetectedEvent(loopStop);
           }
 
           if (
@@ -4147,6 +4742,15 @@ export const useLlmStream = (
           }
         } catch (error: unknown) {
           cleanupReviewLease = true;
+          // Before the delivery callback, which can record an error.
+          if (!allowConcurrentBtwDuringResponse)
+            recordModTurnEnding(
+              modTurnRef.current,
+              prompt_id,
+              isNodeError(error) && error.name === 'AbortError'
+                ? 'aborted'
+                : 'error',
+            );
           metadata?.onDeliveryFailed?.();
           if (error instanceof UnauthorizedError) {
             onAuthError('Session expired or is unauthorized.');
@@ -4169,7 +4773,7 @@ export const useLlmStream = (
             });
           }
         } finally {
-          if (cleanupReviewLease) {
+          if (cleanupReviewLease && !config.getShellExecutionSandbox?.()) {
             cleanupReviewWorktreeLeases({
               sessionId: config.getSessionId(),
               promptId: prompt_id!,
@@ -4202,6 +4806,7 @@ export const useLlmStream = (
               await failClosedGoalTurn(
                 goalBinding,
                 'Goal turn ended without a valid continuation',
+                { userCancelled: turnCancelledRef.current },
               );
             }
           }
@@ -4249,8 +4854,11 @@ export const useLlmStream = (
     },
     [
       streamingState,
+      shellModeActive,
       setModelSwitchedFromQuotaError,
       prepareQueryForLlm,
+      registerToolBatch,
+      scheduleToolCalls,
       processLlmStreamEvents,
       pendingHistoryItemRef,
       addItem,
@@ -4279,6 +4887,7 @@ export const useLlmStream = (
       releaseUndeliveredGoalTurn,
       retainSubmissionActivity,
       setSubmissionInFlight,
+      finishModTurn,
     ],
   );
 
@@ -4445,7 +5054,10 @@ export const useLlmStream = (
       };
       const orphanedEntries: Part[][] = [];
       try {
-        const history = llmClient?.getHistoryShallow?.() ?? [];
+        const history =
+          llmClient?.getChat?.()?.getHistoryForRecovery?.() ??
+          llmClient?.getHistoryShallow?.() ??
+          [];
         for (let i = history.length - 1; i >= 0; i--) {
           const entry = history[i];
           if (!entry || entry.role !== 'user') break;
@@ -4703,6 +5315,10 @@ export const useLlmStream = (
 
   const handleCompletedTools = useCallback(
     async (completedToolCallsFromScheduler: TrackedToolCall[]) => {
+      const sessionId = config.getSessionId();
+      const chat = llmClient?.getChat();
+      const isCurrentSession = () =>
+        config.getSessionId() === sessionId && llmClient?.getChat() === chat;
       const completedAndReadyToSubmitTools =
         completedToolCallsFromScheduler.filter(
           (
@@ -4733,8 +5349,13 @@ export const useLlmStream = (
       // `useReactToolScheduler.allToolCallsCompleteHandler` is single-shot
       // per batch, so a later active-stream early-return would leave
       // the tool stuck in `completed-but-not-submitted` forever (Race A
-      // surfaced in PR #4176 review). The real result is dropped on the
-      // wire — same trade-off upstream Claude Code makes when its
+      // surfaced in PR #4176 review). When the existing response is one
+      // of those synthesized placeholders, the real result REPLACES it
+      // in place (and is recorded to the transcript) so a tool that
+      // actually finished is not reported to the model as "not
+      // recorded" (issue #15297); only a genuine duplicate — a real
+      // response already present for the same id — is dropped on the
+      // wire, the trade-off upstream Claude Code makes when its
       // `StreamingToolExecutor.discard()` follows a
       // `yieldMissingToolResultBlocks` synthesis (`query.ts:733` + `:984`).
       // Walk raw history WITHOUT cloning — `llmClient.getHistory()`
@@ -4756,11 +5377,108 @@ export const useLlmStream = (
       );
       const dedupedCallIds = dedupedTools.map((tc) => tc.request.callId);
       if (dedupedCallIds.length > 0) {
-        debugLogger.warn(
-          `[REPAIR] Dropping ${dedupedCallIds.length} late tool result(s) ` +
-            `whose callId already has a functionResponse in history: ` +
-            `${dedupedCallIds.join(', ')}`,
+        // Optional-call with an empty fallback: some unit-test mocks
+        // predate this accessor, and a missing accessor must degrade to
+        // the old drop behavior rather than crash the batch.
+        const synthesizedRepairCallIds: Set<string> =
+          llmClient?.getSynthesizedRepairCallIds?.() ?? new Set<string>();
+        const replaceableTools = dedupedTools.filter((tc) =>
+          synthesizedRepairCallIds.has(tc.request.callId),
         );
+        const replacedCallIds: string[] = [];
+        let abandonedSessionId: string | null = null;
+        if (replaceableTools.length > 0 && llmClient) {
+          const finalizedReplaceable = await finalizeToolResponses(
+            config,
+            replaceableTools.map(({ request, response }) => ({
+              callId: request.callId,
+              toolName: request.name,
+              responseParts: response.responseParts,
+              persistedOutputFiles: response.persistedOutputFiles,
+              artifacts: response.artifacts,
+            })),
+            new Map(
+              replaceableTools.flatMap(({ request }) =>
+                request.prompt_id
+                  ? [[request.callId, request.prompt_id] as const]
+                  : [],
+              ),
+            ),
+          );
+          // A session swap (/clear, /resume, daemon churn) during the
+          // finalize await leaves the captured chat abandoned: splicing
+          // it is invisible, but recordToolResult resolves its session
+          // at write time and would land the old session's result in the
+          // NEW session's transcript. Skip both; the ids fall through to
+          // the drop bookkeeping below.
+          if (isCurrentSession()) {
+            finalizedReplaceable.forEach((entry, index) => {
+              const { request, response, status } = replaceableTools[index]!;
+              if (
+                !llmClient.replaceSynthesizedToolResponse?.(
+                  entry.callId,
+                  entry.responseParts,
+                )
+              ) {
+                return;
+              }
+              replacedCallIds.push(entry.callId);
+              // Every other completion path emits to the sidecar; without
+              // this a stream-json consumer never sees the late real result.
+              dualOutput?.emitToolResult(request, response);
+              // The drop path never reaches `recordToolResult`, so without
+              // this the transcript keeps a `model[functionCall]` whose
+              // response exists nowhere on disk — the exact phantom shape
+              // reported in issue #15297. The placeholder was itself
+              // in-memory only, so the real result is the first durable
+              // answer for this callId. On `--resume` the repair pass hoists
+              // it back only while it still sits in the user run right after
+              // the call; once a model turn intervenes the scan stops there
+              // and synthesizes a fresh placeholder instead, leaving the
+              // recorded result durable but unreferenced.
+              config.getChatRecordingService?.()?.recordToolResult?.(
+                entry.responseParts,
+                {
+                  callId: entry.callId,
+                  status,
+                  resultDisplay: response.resultDisplay,
+                  persistedOutputFiles: entry.persistedOutputFiles,
+                  artifacts: entry.artifacts,
+                  error: response.error,
+                  errorType: response.errorType,
+                  executionStatus: response.executionStatus,
+                },
+                goalToolResultProvenance(request, entry.responseParts),
+              );
+            });
+            if (replacedCallIds.length > 0) {
+              debugLogger.warn(
+                `[REPAIR] Replaced synthesized placeholder(s) with late ` +
+                  `real tool result(s) for callId(s): ` +
+                  `${replacedCallIds.join(', ')}`,
+              );
+            }
+          } else {
+            abandonedSessionId = sessionId;
+          }
+        }
+        const replacedSet = new Set(replacedCallIds);
+        const droppedCallIds = dedupedCallIds.filter(
+          (id) => !replacedSet.has(id),
+        );
+        if (droppedCallIds.length > 0) {
+          debugLogger.warn(
+            `[REPAIR] Dropping ${droppedCallIds.length} late tool result(s) ` +
+              `whose callId already has a functionResponse in history: ` +
+              `${droppedCallIds.join(', ')}` +
+              // Without this the warning reads as "genuine duplicate" for
+              // ids that were only skipped because the session moved on.
+              (abandonedSessionId
+                ? ` (session ${abandonedSessionId} was abandoned during ` +
+                  `finalize, so its placeholder(s) were not replaced)`
+                : ``),
+          );
+        }
         // Even though the wire-side submission is dropped, the tool DID
         // run locally — `toolCallCount` and `skillsModifiedInSession`
         // must reflect that. Without this, deduped skill-write tools
@@ -4783,7 +5501,7 @@ export const useLlmStream = (
         // never-executed skill-write).
         for (const tc of dedupedTools) {
           if (tc.request.isClientInitiated) continue;
-          if (tc.status === 'cancelled') continue;
+          if (tc.status === 'cancelled' || tc.nativeAttemptsObserved) continue;
           llmClient?.recordCompletedToolCall(
             tc.request.name,
             tc.request.args as Record<string, unknown>,
@@ -4866,6 +5584,57 @@ export const useLlmStream = (
           t.request.isClientInitiated &&
           !historyCallIdsWithResponse.has(t.request.callId),
       );
+      for (const toolCall of clientTools) {
+        const owner = continuationOwnersByToolCallIdRef.current.get(
+          toolCall.request.callId,
+        );
+        if (owner?.restoreResponseBinding) {
+          const [final] = await finalizeToolResponses(
+            config,
+            [
+              {
+                callId: toolCall.request.callId,
+                toolName: toolCall.request.name,
+                responseParts: toolCall.response.responseParts,
+                persistedOutputFiles: toolCall.response.persistedOutputFiles,
+                artifacts: toolCall.response.artifacts,
+              },
+            ],
+            new Map(
+              toolCall.request.prompt_id
+                ? [[toolCall.request.callId, toolCall.request.prompt_id]]
+                : [],
+            ),
+          );
+          await completeRestoreToolResponse(
+            owner.restoreResponseBinding,
+            toolCall.request,
+            final.responseParts,
+            () =>
+              workflowConfigRef.current === config &&
+              !owner.signal.aborted &&
+              isCurrentSession() &&
+              owner.foregroundAbortController !== undefined &&
+              abortControllerRef.current === owner.foregroundAbortController,
+            {
+              toolCallResult: {
+                callId: toolCall.request.callId,
+                status: toolCall.status,
+                resultDisplay: toolCall.response.resultDisplay,
+                error: toolCall.response.error,
+                errorType: toolCall.response.errorType,
+                executionStatus: toolCall.response.executionStatus,
+                persistedOutputFiles: final.persistedOutputFiles,
+                artifacts: final.artifacts,
+              },
+              options: goalToolResultProvenance(
+                toolCall.request,
+                final.responseParts,
+              ),
+            },
+          );
+        }
+      }
       if (clientTools.length > 0) {
         markToolsAsSubmitted(clientTools.map((t) => t.request.callId));
       }
@@ -4873,6 +5642,7 @@ export const useLlmStream = (
       // Identify new, successful save_memory calls that we haven't processed yet.
       const newSuccessfulMemorySaves = completedAndReadyToSubmitTools.filter(
         (t) =>
+          !t.nativeAttemptsObserved &&
           t.request.name === 'save_memory' &&
           t.status === 'success' &&
           !processedMemoryToolsRef.current.has(t.request.callId),
@@ -4939,7 +5709,10 @@ export const useLlmStream = (
             toolCall.request.prompt_id,
           );
         }
-        if (toolCall.status !== 'cancelled') {
+        if (
+          toolCall.status !== 'cancelled' &&
+          !toolCall.nativeAttemptsObserved
+        ) {
           llmClient?.recordCompletedToolCall(
             toolCall.request.name,
             toolCall.request.args as Record<string, unknown>,
@@ -4971,11 +5744,42 @@ export const useLlmStream = (
       }
       let promptId =
         ownerToolCall?.request.prompt_id ?? continuationOwner?.promptId;
+      const pairGoalToolResponsesIntoHistory = async () => {
+        if (!llmClient || llmTools.length === 0) return;
+        const responses = await finalizeToolResponses(
+          config,
+          llmTools.map(({ request, response }) => ({
+            callId: request.callId,
+            toolName: request.name,
+            responseParts: response.responseParts,
+            persistedOutputFiles: response.persistedOutputFiles,
+            artifacts: response.artifacts,
+          })),
+          new Map(
+            llmTools.flatMap(({ request }) =>
+              request.prompt_id
+                ? [[request.callId, request.prompt_id] as const]
+                : [],
+            ),
+          ),
+        );
+        llmClient.addHistory({
+          role: 'user',
+          parts: responses.flatMap((entry) => entry.responseParts),
+        });
+      };
       const endToolInteraction = (
         status: 'ok' | 'error' | 'cancelled',
         errorMessage?: string,
         errorType?: string,
+        endsModTurn = true,
       ) => {
+        if (endsModTurn && status !== 'ok')
+          recordModTurnEnding(
+            modTurnRef.current,
+            promptId,
+            status === 'cancelled' ? 'aborted' : 'error',
+          );
         if (continuationOwner?.detachedAbortController) {
           detachedToolContinuationAbortControllersRef.current.delete(
             continuationOwner.detachedAbortController,
@@ -5012,6 +5816,7 @@ export const useLlmStream = (
         toolGoalPermit = sharedGoalPermit(toolGoalContexts);
       } catch (error) {
         const callIds = llmTools.map((toolCall) => toolCall.request.callId);
+        await pairGoalToolResponsesIntoHistory();
         markToolsAsSubmitted(callIds);
         const reason = getErrorMessage(error);
         const bindings = new Map<string, GoalTurnBinding>();
@@ -5033,7 +5838,12 @@ export const useLlmStream = (
           bindings.set(binding.turnKey, binding);
         }
         for (const binding of bindings.values()) {
-          await failClosedGoalTurn(binding, reason);
+          // `reason` here is a scheduler diagnostic, not something a user
+          // reads. It stays the abort cause and the error item; the durable
+          // `lastReason` gets the builder's detail-free sentence.
+          await failClosedGoalTurn(binding, reason, {
+            pauseReason: goalPauseReasonForFailure(''),
+          });
         }
         addItem(
           {
@@ -5064,11 +5874,14 @@ export const useLlmStream = (
           }
         }
         if (active && activeGoalPermitValid) {
+          await pairGoalToolResponsesIntoHistory();
           markToolsAsSubmitted(
             llmTools.map((toolCall) => toolCall.request.callId),
           );
           const reason = 'ToolResult batch is missing the active Goal context';
-          await failClosedGoalTurn(active, reason);
+          await failClosedGoalTurn(active, reason, {
+            pauseReason: goalPauseReasonForFailure(''),
+          });
           addItem(
             {
               type: MessageType.ERROR,
@@ -5088,11 +5901,14 @@ export const useLlmStream = (
       if (toolGoalPermit) {
         const existing = goalTurnBindingsRef.current.get(toolGoalPermit.turnId);
         if (existing && !sameGoalPermit(existing.permit, toolGoalPermit)) {
+          await pairGoalToolResponsesIntoHistory();
           markToolsAsSubmitted(
             llmTools.map((toolCall) => toolCall.request.callId),
           );
           const reason = 'ToolResult batch has a stale Goal context';
-          await failClosedGoalTurn(existing, reason);
+          await failClosedGoalTurn(existing, reason, {
+            pauseReason: goalPauseReasonForFailure(''),
+          });
           addItem(
             {
               type: MessageType.ERROR,
@@ -5115,13 +5931,13 @@ export const useLlmStream = (
             'runtime',
           );
       }
-      const memoryWriteCandidates = completedAndReadyToSubmitTools.map(
-        (toolCall) => ({
+      const memoryWriteCandidates = completedAndReadyToSubmitTools
+        .filter((call) => !call.nativeAttemptsObserved)
+        .map((toolCall) => ({
           toolName: toolCall.request.name,
           args: toolCall.request.args as Record<string, unknown>,
           status: toolCall.status,
-        }),
-      );
+        }));
       const didRefreshManagedMemory = await refreshMemoryAfterManagedWrite(
         config,
         memoryWriteCandidates,
@@ -5143,6 +5959,10 @@ export const useLlmStream = (
             logContext: 'interactive context-file memory tool batch',
           });
         }
+      }
+      if (!isCurrentSession()) {
+        if (toolGoalBinding) releaseGoalTurn(toolGoalBinding);
+        return;
       }
       if (newSuccessfulMemorySaves.length > 0) {
         if (!didRefreshManagedMemory) {
@@ -5191,6 +6011,7 @@ export const useLlmStream = (
       }
 
       for (const toolCall of llmTools) {
+        if (toolCall.nativeAttemptsObserved) continue;
         llmClient?.recordCompletedToolCall(
           toolCall.request.name,
           toolCall.request.args as Record<string, unknown>,
@@ -5205,6 +6026,7 @@ export const useLlmStream = (
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation ended without a result',
+            { pauseReason: goalPauseReasonForFailure('') },
           );
         }
         if (
@@ -5293,6 +6115,10 @@ export const useLlmStream = (
       const responsesToSend = finalizedResponses.flatMap(
         (entry) => entry.responseParts,
       );
+      if (!isCurrentSession()) {
+        if (toolGoalBinding) releaseGoalTurn(toolGoalBinding);
+        return;
+      }
       orderedResponses.forEach(({ request, response, status }, index) => {
         config.getChatRecordingService?.()?.recordToolResult?.(
           finalizedResponses[index].responseParts,
@@ -5307,11 +6133,32 @@ export const useLlmStream = (
             errorType: response.errorType,
             executionStatus: response.executionStatus,
           },
-          goalToolResultProvenance(request),
+          goalToolResultProvenance(
+            request,
+            finalizedResponses[index].responseParts,
+          ),
         );
       });
 
       if (continuationWasCancelled()) {
+        // This is the branch a cancelled tool batch actually takes: the
+        // controller retained across tool execution feeds the continuation
+        // owner's signal, so pressing Esc while tools run aborts it here
+        // rather than at either of the branches below. `markToolsAsSubmitted`
+        // stops these callIds ever being submitted, so unless the responses
+        // are written now the model's function calls stay unanswered and the
+        // next turn sends a history with an unpaired call. The
+        // all-cancelled branch below writes them for the batch it handles;
+        // this branch owes its own batch the same pairing, whether or not
+        // every tool in it was cancelled.
+        if (llmClient) {
+          const pairedCallIds = llmClient.getHistoryFunctionResponseIds();
+          const unpairedParts = finalizedResponses
+            .filter((entry) => !pairedCallIds.has(entry.callId))
+            .flatMap((entry) => entry.responseParts);
+          if (unpairedParts.length > 0)
+            llmClient.addHistory({ role: 'user', parts: unpairedParts });
+        }
         markToolsAsSubmitted(
           llmTools.map((toolCall) => toolCall.request.callId),
         );
@@ -5319,6 +6166,7 @@ export const useLlmStream = (
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation was cancelled',
+            { userCancelled: true },
           );
         }
         endToolInteraction('cancelled');
@@ -5348,9 +6196,16 @@ export const useLlmStream = (
         );
         markToolsAsSubmitted(callIdsToMarkAsSubmitted);
         if (toolGoalBinding) {
+          // Every cancellation that reaches here originates in a user action:
+          // either Esc through `cancelOngoingRequest`, or a declined tool
+          // confirmation, which the dialog consumes so `turnCancelledRef`
+          // stays false. Selecting the failure arm on that ref would tell a
+          // user who declined one command that their Goal stopped because a
+          // turn failed.
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation was cancelled',
+            { userCancelled: true },
           );
         }
         endToolInteraction('cancelled');
@@ -5422,13 +6277,14 @@ export const useLlmStream = (
             if (
               status === 'complete' ||
               status === 'blocked' ||
+              status === 'paused' ||
               status === 'usage_limited'
             ) {
               addItem(
                 {
                   type: 'goal_state',
                   snapshot,
-                  cause: status,
+                  cause: status === 'paused' ? 'pause' : status,
                 },
                 Date.now(),
               );
@@ -5440,6 +6296,7 @@ export const useLlmStream = (
           await failClosedGoalTurn(
             toolGoalBinding,
             `Goal turn could not finish: ${errorMessage}`,
+            { pauseReason: goalPauseReasonForFailure(errorMessage) },
           );
         } finally {
           // Idempotent with the release inside failClosedGoalTurn; also covers the success path.
@@ -5555,9 +6412,11 @@ export const useLlmStream = (
       // Don't continue if model was switched due to quota error
       if (modelSwitchedFromQuotaError) {
         if (toolGoalBinding) {
+          llmClient?.addHistory({ role: 'user', parts: responsesToSend });
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation stopped after a model switch',
+            { pauseReason: goalPauseReasonForFailure('') },
           );
         }
         endToolInteraction('cancelled');
@@ -5586,6 +6445,7 @@ export const useLlmStream = (
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation stopped: background capacity exhausted',
+            { pauseReason: goalPauseReasonForFailure('') },
           );
         }
         endToolInteraction(
@@ -5595,6 +6455,8 @@ export const useLlmStream = (
         );
         return;
       }
+
+      const toolResultPartsForPause = responsesToSend.slice();
 
       // Drain steerable user messages at this sampling boundary and append
       // them after the tool responses as genuine user content.
@@ -5764,13 +6626,25 @@ export const useLlmStream = (
             }
           : undefined;
 
+      // Both exits below leave a batch whose callIds are already marked
+      // submitted, so the responses have to reach history here or the
+      // model's function calls stay unanswered and the next `/goal resume`
+      // sends an unpaired call -- the same pairing the cancellation check
+      // above owes its own batch.
       if (continuationWasCancelled()) {
         drainedSteer?.restore();
         settleDrainedTeammates(false);
         if (toolGoalBinding) {
+          if (llmClient) {
+            llmClient.addHistory({
+              role: 'user',
+              parts: toolResultPartsForPause,
+            });
+          }
           await failClosedGoalTurn(
             toolGoalBinding,
             'Goal tool continuation was cancelled',
+            { userCancelled: true },
           );
         }
         endToolInteraction('cancelled');
@@ -5779,9 +6653,16 @@ export const useLlmStream = (
       if (toolGoalBinding?.controller.signal.aborted) {
         drainedSteer?.restore();
         settleDrainedTeammates(false);
+        if (llmClient) {
+          llmClient.addHistory({
+            role: 'user',
+            parts: toolResultPartsForPause,
+          });
+        }
         await failClosedGoalTurn(
           toolGoalBinding,
           'Goal tool continuation was preempted',
+          { pauseReason: GOAL_PAUSE_REASON_USER_INTERRUPT },
         );
         endToolInteraction('cancelled');
         return;
@@ -5800,10 +6681,13 @@ export const useLlmStream = (
         },
         onDeliveryFailed: () => {
           submissionSettlement?.restore();
+          // The continuation's own failure already marks the Mod turn; a
+          // stale flag from a concurrent /btw must not.
           endToolInteraction(
             'error',
             'tool continuation delivery failed',
             'continuation_delivery_failed',
+            false,
           );
         },
         goalBinding: toolGoalBinding,
@@ -5834,26 +6718,31 @@ export const useLlmStream = (
     handleCompletedToolsRef.current = handleCompletedTools;
   }, [handleCompletedTools]);
 
-  const pendingHistoryItems = useMemo(
-    () =>
-      [
-        // Reasoning renders above the streaming answer.
-        pendingThoughtItem,
-        ...pendingAssistantItems,
-        pendingHistoryItem,
-        pendingRetryErrorItem,
-        pendingRetryCountdownItem,
-        pendingToolCallGroupDisplay,
-      ].filter((i) => i !== undefined && i !== null),
-    [
+  const pendingHistoryItems = useMemo(() => {
+    // A completed batch precedes the response that consumes its results.
+    const toolGroupFinished = pendingToolCallGroupDisplay?.tools.every(
+      (tool) =>
+        tool.status === ToolCallStatus.Success ||
+        tool.status === ToolCallStatus.Error ||
+        tool.status === ToolCallStatus.Canceled,
+    );
+    return [
+      toolGroupFinished ? pendingToolCallGroupDisplay : undefined,
+      ...pendingAssistantItems,
       pendingThoughtItem,
-      pendingAssistantItems,
+      toolGroupFinished ? undefined : pendingToolCallGroupDisplay,
       pendingHistoryItem,
       pendingRetryErrorItem,
       pendingRetryCountdownItem,
-      pendingToolCallGroupDisplay,
-    ],
-  );
+    ].filter((i) => i !== undefined && i !== null);
+  }, [
+    pendingThoughtItem,
+    pendingAssistantItems,
+    pendingHistoryItem,
+    pendingRetryErrorItem,
+    pendingRetryCountdownItem,
+    pendingToolCallGroupDisplay,
+  ]);
 
   useEffect(() => {
     const saveRestorableToolCalls = async () => {
@@ -5905,6 +6794,11 @@ export const useLlmStream = (
             const fileName = path.basename(filePath);
             const toolCallWithSnapshotFileName = `${timestamp}-${fileName}-${toolName}.json`;
             const clientHistory = llmClient?.getHistoryShallow();
+            // JSON.stringify drops the Symbol-keyed prompt identity, so
+            // persist it as a parallel array for /restore to re-mark against.
+            const promptIds = clientHistory?.map(
+              (content) => getApiHistoryPromptId(content) ?? null,
+            );
             const toolCallWithSnapshotFilePath = path.join(
               checkpointDir,
               toolCallWithSnapshotFileName,
@@ -5916,7 +6810,9 @@ export const useLlmStream = (
                 {
                   history,
                   clientHistory,
+                  ...(promptIds?.some(Boolean) ? { promptIds } : {}),
                   toolCall: {
+                    callId: toolCall.request.callId,
                     name: toolCall.request.name,
                     args: toolCall.request.args,
                   },
@@ -5941,19 +6837,63 @@ export const useLlmStream = (
   }, [toolCalls, config, onDebugMessage, history, llmClient, storage]);
 
   // ─── Unified notification queue (cron + background agents) ──────
-  const notificationQueueRef = useRef<
-    Array<{
-      displayText: string;
-      modelText: string;
-      sendMessageType: SendMessageType;
-      monitor?: { id: string; status: string };
-      todoWorkChainId?: string;
-      onDelivered?: () => void;
-      onDeliveryFailed?: () => void;
-      displayed?: boolean;
-    }>
-  >([]);
+  const notificationQueueRef = useRef<QueuedNotification[]>([]);
   const [notificationTrigger, setNotificationTrigger] = useState(0);
+  /**
+   * Notifications lost to queue overflow since the last drain, reported as one
+   * summary on the next drained turn. Per-loss lines would reproduce the very
+   * flooding the cap exists to stop.
+   */
+  const droppedNotificationsRef = useRef(new DroppedNotificationTally());
+  /**
+   * A summary already taken from the tally but not yet accepted by a turn.
+   * `take()` resets the tally, so a rejected admission would otherwise lose
+   * the only record of what overflow discarded; the drain parks it here and
+   * the next drain reuses it, exactly as it re-queues the rejected batch.
+   */
+  const pendingDroppedSummaryRef = useRef<PendingDroppedSummary | undefined>(
+    undefined,
+  );
+  /**
+   * Admit one notification into the shared queue, evicting or dropping when it
+   * is full. Agent and workflow results and cron prompts are protected: an
+   * agent result is the only copy of what a background agent produced, and a
+   * cron prompt is work the user scheduled. Shell results and monitor pulses
+   * absorb the overflow, pulses first — the next poll supersedes them anyway.
+   */
+  const admitNotification = useCallback(
+    (item: QueuedNotification): void => {
+      const queue = notificationQueueRef.current;
+      const admission = decideNotificationAdmission(queue, item, {
+        max: MAX_BACKGROUND_NOTIFICATION_QUEUE,
+        isProtected: isProtectedNotification,
+      });
+      if (admission.action === 'drop') {
+        debugLogger.warn(
+          `Notification queue overflow: dropping task=${item.taskId ?? 'unknown'} kind=${item.kind} because ${admission.reason === 'all-protected' ? 'every queued notification is protected' : 'the next monitor pulse will supersede it'}`,
+        );
+        droppedNotificationsRef.current.record(item);
+        return;
+      }
+      if (admission.action === 'evict') {
+        const [evicted] = queue.splice(admission.index, 1);
+        debugLogger.warn(
+          `Notification queue overflow: evicting task=${evicted?.taskId ?? 'unknown'} kind=${evicted?.kind ?? 'unknown'}`,
+        );
+        if (evicted) {
+          const cancelledPulse =
+            evicted.interim &&
+            evicted.taskId !== undefined &&
+            config.getMonitorRegistry().get(evicted.taskId)?.status ===
+              'cancelled';
+          if (!cancelledPulse) droppedNotificationsRef.current.record(evicted);
+        }
+      }
+      queue.push(item);
+      setNotificationTrigger((n) => n + 1);
+    },
+    [config],
+  );
   // Last time an interim-monitor-led notification batch started a model turn
   // (#10818 cooldown).
   const lastInterimMonitorTurnAtRef = useRef(0);
@@ -5999,6 +6939,8 @@ export const useLlmStream = (
     }
     notificationQueueSessionIdRef.current = sessionStates.sessionId;
     notificationQueueRef.current = [];
+    droppedNotificationsRef.current.clear();
+    pendingDroppedSummaryRef.current = undefined;
     autonomousLoopTickResolverRef.current?.resetCache();
   }, [sessionStates.sessionId]);
 
@@ -6068,23 +7010,25 @@ export const useLlmStream = (
             const tick = resolver.resolveAutonomous(autonomousMode);
             label = 'Autonomous loop tick';
             modelText = tick.modelText;
-            notificationQueueRef.current.push({
+            admitNotification({
               displayText: `${job.missed ? 'Missed' : source}: ${label}`,
               modelText,
               sendMessageType: SendMessageType.Cron,
+              kind: 'cron',
+              taskId: job.id,
               todoWorkChainId: job.todoWorkChainId,
               onDelivered: () => resolver.markDelivered(),
             });
-            setNotificationTrigger((n) => n + 1);
             return;
           }
-          notificationQueueRef.current.push({
+          admitNotification({
             displayText: `${job.missed ? 'Missed' : source}: ${label}`,
             modelText,
             sendMessageType: SendMessageType.Cron,
+            kind: 'cron',
+            taskId: job.id,
             todoWorkChainId: job.todoWorkChainId,
           });
-          setNotificationTrigger((n) => n + 1);
         },
       );
     })();
@@ -6097,59 +7041,74 @@ export const useLlmStream = (
         process.stderr.write(summary + '\n');
       }
     };
-  }, [config, getAutonomousLoopTickResolver, isConfigInitialized]);
+  }, [
+    admitNotification,
+    config,
+    getAutonomousLoopTickResolver,
+    isConfigInitialized,
+  ]);
 
   // Register background agent notification callback onto the shared queue.
   useEffect(() => {
     const registry = config.getBackgroundTaskRegistry();
     registry.setNotificationCallback((displayText, modelText, meta) => {
-      notificationQueueRef.current.push({
+      admitNotification({
         displayText,
         modelText,
         sendMessageType: SendMessageType.Notification,
+        kind: 'agent',
+        taskId: meta?.agentId,
         todoWorkChainId: meta?.todoWorkChainId,
       });
-      setNotificationTrigger((n) => n + 1);
     });
     return () => {
       registry.setNotificationCallback(undefined);
     };
-  }, [config]);
+  }, [admitNotification, config]);
 
   // Register background shell terminal notification callback onto the shared queue.
   useEffect(() => {
     const registry = config.getBackgroundShellRegistry();
     registry.setNotificationCallback((displayText, modelText, meta) => {
-      notificationQueueRef.current.push({
+      admitNotification({
         displayText,
         modelText,
         sendMessageType: SendMessageType.Notification,
+        kind: 'shell',
+        taskId: meta?.shellId,
         todoWorkChainId: meta?.todoWorkChainId,
       });
-      setNotificationTrigger((n) => n + 1);
     });
     return () => {
       registry.setNotificationCallback(undefined);
     };
-  }, [config]);
+  }, [admitNotification, config]);
 
-  // Register background workflow completions onto the shared queue. The
-  // registry keeps this separate from its terminal-bell subscriber.
+  // Register background and client-started foreground workflow completions.
+  // The registry keeps this separate from its terminal-bell subscriber.
   useEffect(() => {
     const registry = config.getWorkflowRunRegistry();
     registry.setCompletionCallback((displayText, modelText, meta) => {
-      notificationQueueRef.current.push({
+      // The result must remain visible even if the model request is delayed
+      // or fails. Background notifications retain their existing drain timing.
+      const displayed = meta.isBackgrounded === false;
+      if (displayed) {
+        addItem({ type: 'notification', text: displayText }, Date.now());
+      }
+      admitNotification({
         displayText,
         modelText,
         sendMessageType: SendMessageType.Notification,
+        kind: 'workflow',
+        taskId: meta.runId,
         todoWorkChainId: meta.todoWorkChainId,
+        displayed,
       });
-      setNotificationTrigger((n) => n + 1);
     });
     return () => {
       registry.setCompletionCallback(undefined);
     };
-  }, [config]);
+  }, [addItem, admitNotification, config]);
 
   // Register monitor notification callback onto the shared queue.
   useEffect(() => {
@@ -6159,19 +7118,21 @@ export const useLlmStream = (
         const entry = registry.get(meta.monitorId);
         if (!entry || entry.status !== 'running') return;
       }
-      notificationQueueRef.current.push({
+      admitNotification({
         displayText,
         modelText,
         sendMessageType: SendMessageType.Notification,
+        kind: 'monitor',
+        taskId: meta.monitorId,
+        interim: meta.status === 'running',
         monitor: { id: meta.monitorId, status: meta.status },
         todoWorkChainId: meta.todoWorkChainId,
       });
-      setNotificationTrigger((n) => n + 1);
     });
     return () => {
       registry.setNotificationCallback(undefined);
     };
-  }, [config]);
+  }, [admitNotification, config]);
 
   // When idle, batch-drain all contiguous same-type notifications from the
   // front of the queue into a single API call. This reduces token waste: N
@@ -6241,29 +7202,88 @@ export const useLlmStream = (
         }
         const targetType = queue[0]!.sendMessageType;
 
+        // Report what overflow discarded on the first turn that follows it, so
+        // the model learns what it will never be told about before it acts on
+        // the notifications that survived. Parked until a turn accepts it.
+        const droppedSummary: PendingDroppedSummary | undefined =
+          pendingDroppedSummaryRef.current ??
+          droppedNotificationsRef.current.take();
+        pendingDroppedSummaryRef.current = droppedSummary;
+        const displayDroppedSummary = (at: number) => {
+          if (!droppedSummary || droppedSummary.displayed) return;
+          addItem(
+            { type: 'notification' as const, text: droppedSummary.displayText },
+            at,
+          );
+          droppedSummary.displayed = true;
+        };
+        const withDroppedSummary = (text: string) =>
+          droppedSummary ? `${droppedSummary.modelText}\n\n${text}` : text;
+        const releaseDroppedSummary = () => {
+          pendingDroppedSummaryRef.current = undefined;
+        };
+        const restoreDroppedSummary = () => {
+          pendingDroppedSummaryRef.current = droppedSummary;
+        };
+        const restoreBatch = (batch: QueuedNotification[]) => {
+          queue.unshift(...batch);
+          while (queue.length > MAX_BACKGROUND_NOTIFICATION_QUEUE) {
+            const admission = decideNotificationAdmission(
+              queue,
+              { ...queue[0]!, interim: false },
+              {
+                max: MAX_BACKGROUND_NOTIFICATION_QUEUE,
+                isProtected: isProtectedNotification,
+              },
+            );
+            const victimIndex =
+              admission.action === 'evict' ? admission.index : queue.length - 1;
+            const [victim] = queue.splice(victimIndex, 1);
+            if (victim) droppedNotificationsRef.current.record(victim);
+          }
+        };
+
         // Cron prompts must run as individual turns — each needs its own
         // slash/shell/@ preprocessing and approval cycle. Only batch
         // Notification items (which pass through without preprocessing).
         if (targetType === SendMessageType.Cron) {
           const item = queue.shift()!;
+          const cronAt = Date.now();
+          if (
+            queue.some(
+              (queued) =>
+                queued.sendMessageType === SendMessageType.Notification,
+            )
+          ) {
+            displayDroppedSummary(cronAt);
+          }
           if (!item.displayed) {
             addItem(
               { type: 'notification' as const, text: item.displayText },
-              Date.now(),
+              cronAt,
             );
             item.displayed = true;
           }
           void submitQuery(item.modelText, item.sendMessageType, undefined, {
             notificationDisplayText: item.displayText,
             todoWorkChainId: item.todoWorkChainId,
+            // A cron prompt is never a shell command, whatever mode the
+            // composer happens to be in when the queue drains — with a gate
+            // the text also carries a command's untrusted output.
+            shellMode: false,
             onDelivered: item.onDelivered,
-            onDeliveryFailed: item.onDeliveryFailed,
+            onDeliveryFailed: () => {
+              restoreDroppedSummary();
+              item.onDeliveryFailed?.();
+            },
             onAdmissionFailed: () => {
               queue.unshift(item);
+              restoreDroppedSummary();
             },
             claimGoalTurn: admission.claimGoalTurn,
             onGoalClaimDeferred: () => {
               queue.unshift(item);
+              restoreDroppedSummary();
               setNotificationTrigger((n) => n + 1);
             },
           }).catch((error) => {
@@ -6286,31 +7306,41 @@ export const useLlmStream = (
           lastInterimMonitorTurnAtRef.current = Date.now();
         }
 
-        const now = Date.now();
-        for (const item of batch) {
-          if (!item.displayed) {
-            addItem(
-              { type: 'notification' as const, text: item.displayText },
-              now,
-            );
-            item.displayed = true;
-          }
-        }
-
         const combinedModelText = batch.map((e) => e.modelText).join('\n\n');
         const combinedDisplayText = batch.map((e) => e.displayText).join('; ');
-        void submitQuery(combinedModelText, targetType, undefined, {
-          notificationDisplayText: combinedDisplayText,
-          todoWorkChainId: batch[0]?.todoWorkChainId,
-          onAdmissionFailed: () => {
-            queue.unshift(...batch);
+        releaseDroppedSummary();
+        void submitQuery(
+          withDroppedSummary(combinedModelText),
+          targetType,
+          undefined,
+          {
+            notificationDisplayText: combinedDisplayText,
+            todoWorkChainId: batch[0]?.todoWorkChainId,
+            onAdmissionFailed: () => {
+              restoreBatch(batch);
+              restoreDroppedSummary();
+            },
+            claimGoalTurn: admission.claimGoalTurn,
+            onGoalClaimDeferred: () => {
+              restoreBatch(batch);
+              restoreDroppedSummary();
+              setNotificationTrigger((n) => n + 1);
+            },
+            onRequestStarted: () => {
+              const now = Date.now();
+              displayDroppedSummary(now);
+              for (const item of batch) {
+                if (!item.displayed) {
+                  addItem(
+                    { type: 'notification' as const, text: item.displayText },
+                    now,
+                  );
+                  item.displayed = true;
+                }
+              }
+            },
           },
-          claimGoalTurn: admission.claimGoalTurn,
-          onGoalClaimDeferred: () => {
-            queue.unshift(...batch);
-            setNotificationTrigger((n) => n + 1);
-          },
-        }).catch((error) => {
+        ).catch((error) => {
           debugLogger.warn('Failed to admit background notification', error);
         });
       });
@@ -6432,6 +7462,7 @@ export const useLlmStream = (
 
   return {
     streamingState,
+    workflowKeywordActive,
     submitQuery,
     initError,
     pendingHistoryItems,

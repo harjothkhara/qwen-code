@@ -9,14 +9,14 @@ use cua_driver_contract::{
     ActionResult, ClickInput, ClipboardReadInput, ClipboardWriteInput, DoubleClickInput, DragInput,
     EndSessionInput, EndSessionOutput, EscalateSessionInput, GetAgentCursorStateInput,
     GetCursorPositionInput, GetDesktopStateInput, GetScreenSizeInput, GetSessionInput,
-    GetSessionStateInput, GetWindowStateInput, HotkeyInput, InvokeMenuInput, ListAppsInput,
-    ListSessionsInput, ListSessionsOutput, ListWindowsInput, MoveCursorInput,
-    PerformSecondaryActionInput, PressKeyInput, RightClickInput, ScrollInput, SessionOutput,
-    SessionStateOutput, SetAgentCursorEnabledInput, SetAgentCursorMotionInput,
-    SetAgentCursorThemeInput, SetValueInput, SetWindowFrameInput, StartSessionInput,
-    StartSessionOutput, ToolInput, TypeTextInput, VerifyStateInput, VerifyStateOutput,
-    WindowClickInput, WindowDragInput, WindowHotkeyInput, WindowPressKeyInput, WindowScrollInput,
-    WindowTypeTextInput,
+    GetSessionStateInput, GetWindowStateInput, HotkeyInput, InvokeMenuInput, LaunchAppInput,
+    ListAppsInput, ListSessionsInput, ListSessionsOutput, ListWindowsInput, MoveCursorInput,
+    PasteInput, PerformSecondaryActionInput, PressKeyInput, RightClickInput, ScrollInput,
+    SelectTextInput, SessionOutput, SessionStateOutput, SetAgentCursorEnabledInput,
+    SetAgentCursorMotionInput, SetAgentCursorThemeInput, SetValueInput, SetWindowFrameInput,
+    StartSessionInput, StartSessionOutput, ToolInput, TypeTextInput, VerifyStateInput,
+    VerifyStateOutput, WindowClickInput, WindowDragInput, WindowHotkeyInput, WindowPressKeyInput,
+    WindowScrollInput, WindowTypeTextInput,
 };
 use cua_driver_core::daemon::{
     is_daemon_listening, request_daemon_metadata, send_request, socket_path_for_namespace,
@@ -623,6 +623,7 @@ macro_rules! desktop_tool_methods {
     ($callback:ident) => {
         $callback! {
             list_apps: ListAppsInput,
+            launch_app: LaunchAppInput,
             list_windows: ListWindowsInput,
             get_desktop_state: GetDesktopStateInput,
             get_window_state: GetWindowStateInput,
@@ -649,6 +650,8 @@ macro_rules! desktop_tool_methods {
             hotkey: HotkeyInput,
             window_hotkey: WindowHotkeyInput,
             set_value: SetValueInput,
+            paste: PasteInput,
+            select_text: SelectTextInput,
             perform_secondary_action: PerformSecondaryActionInput,
             set_agent_cursor_enabled: SetAgentCursorEnabledInput,
             set_agent_cursor_motion: SetAgentCursorMotionInput,
@@ -1796,7 +1799,19 @@ fn normalize_result(tool: &str, raw: Value) -> Result<ToolResult, DriverError> {
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let action = if !is_error && cua_driver_core::action_record::is_action_tool(tool) {
+    let app_action =
+        structured.is_some_and(|value| value.get("computer_use") == Some(&serde_json::json!(1)));
+    if !is_error && app_action {
+        serde_json::from_value::<cua_driver_contract::computer_use::AppActionOutput>(
+            structured.unwrap().clone(),
+        )
+        .and_then(|value| value.validate().map_err(serde::de::Error::custom))
+        .map_err(|error| DriverError::Protocol {
+            reason: format!("{tool} returned an invalid Computer Use acknowledgement: {error}"),
+        })?;
+    }
+    let action = if !is_error && !app_action && cua_driver_core::action_record::is_action_tool(tool)
+    {
         let structured = structured.ok_or_else(|| DriverError::Protocol {
             reason: format!("{tool} response omitted ActionResult"),
         })?;
@@ -2081,9 +2096,11 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        for published in EXPORTED_TOOL_NAMES {
-            assert!(names.contains(published), "missing {published}");
+        for spec in cua_driver_contract::computer_use::tools() {
+            assert!(names.contains(spec.name), "missing {}", spec.name);
         }
+        assert!(!names.contains("start_recording"));
+        assert!(!names.contains("get_browser_state"));
 
         driver.shutdown().await.unwrap();
         driver.shutdown().await.unwrap();
@@ -2845,6 +2862,13 @@ mod tests {
             DriverError::Protocol { reason }
                 if reason.contains("omitted ActionResult")
         ));
+    }
+
+    #[test]
+    fn generic_app_action_acknowledgement_does_not_claim_a_legacy_action_effect() {
+        let result = normalize_result("click", serde_json::json!({"content":[{"type":"text","text":"Sent but not confirmed."}],"structuredContent":{"computer_use":1,"sent":true}})).unwrap();
+        assert!(result.action.is_none());
+        assert_eq!(result.text, "Sent but not confirmed.");
     }
 
     #[tokio::test]

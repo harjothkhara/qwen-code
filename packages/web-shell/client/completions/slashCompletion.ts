@@ -332,6 +332,7 @@ export function getImplicitTabCompletion(
 
   const cmdName = match[1];
   const cmd = commands.find((c) => c.name === cmdName);
+  if (cmd?.source === 'skill') return null;
   const tree = language === 'zh-CN' ? SUBCOMMAND_TREE_ZH : SUBCOMMAND_TREE_EN;
   if (cmd?.subcommands?.length || tree[cmdName] || cmdName === 'skills') {
     return null;
@@ -362,6 +363,8 @@ export function getSlashCommandArgumentHint(
   if (!cmd) return null;
 
   const subcommandPath = match[2]?.trim();
+  if (cmd.source === 'skill')
+    return subcommandPath ? null : cmd.argumentHint?.trim() || null;
   if (subcommandPath) {
     const parts = subcommandPath.split(/\s+/);
     if (cmdName === 'skills' && parts.length === 1) {
@@ -484,6 +487,7 @@ export function getSlashCommandCompletionResult(
   language: WebShellLanguage = 'en',
   translate: Translate = (key) => key,
   categoryOrder: CommandDisplayCategoryOrder = DEFAULT_COMMAND_CATEGORY_ORDER,
+  includeEmpty = false,
 ): SlashCommandCompletionResult | null {
   const {
     lineStart,
@@ -499,6 +503,7 @@ export function getSlashCommandCompletionResult(
   if (subMatch) {
     const [, cmdName, rest] = subMatch;
     const cmd = commands.find((c) => c.name === cmdName);
+    if (cmd?.source === 'skill') return null;
     const tree = language === 'zh-CN' ? SUBCOMMAND_TREE_ZH : SUBCOMMAND_TREE_EN;
     const implicitTree =
       language === 'zh-CN'
@@ -523,6 +528,7 @@ export function getSlashCommandCompletionResult(
       return null;
     }
 
+    const isSkillList = cmdName === 'skills' && completedParts.length === 0;
     const nodes = resolveSubcommands(
       cmdName,
       completedParts,
@@ -531,18 +537,17 @@ export function getSlashCommandCompletionResult(
       cmd?.subcommands,
       cmd?.argumentHint,
     );
-    if (!nodes) return null;
+    if (!nodes && !(includeEmpty && isSkillList)) return null;
 
     const lp = currentTyping.toLowerCase();
     const prefix = `/${cmdName} ${
       completedParts.length > 0 ? completedParts.join(' ') + ' ' : ''
     }`;
-    const filteredNodes = nodes
+    const filteredNodes = (nodes ?? [])
       .filter((n) => !currentTyping || n.name.toLowerCase().includes(lp))
       .sort((a, b) =>
         currentTyping ? comparePrefixFirst(a.name, b.name, lp) : 0,
       );
-    const isSkillList = cmdName === 'skills' && completedParts.length === 0;
     const items = filteredNodes
       .slice(0, COMPLETION_ITEM_LIMIT)
       .map((node): SlashCommandCompletionItem => {
@@ -560,7 +565,7 @@ export function getSlashCommandCompletionResult(
         };
       });
 
-    if (items.length === 0) return null;
+    if (items.length === 0 && !(includeEmpty && isSkillList)) return null;
     return {
       kind: 'subcommand',
       from: lineStart,
@@ -618,7 +623,7 @@ export function getSlashCommandCompletionResult(
       };
     });
 
-  if (items.length === 0) return null;
+  if (items.length === 0 && !includeEmpty) return null;
   return {
     kind: 'command',
     from: lineStart,
@@ -648,6 +653,7 @@ export function slashCompletionSource(
       const [, cmdName, rest] = subMatch;
       const commands = getCommands();
       const cmd = commands.find((c) => c.name === cmdName);
+      if (cmd?.source === 'skill') return null;
       const language = getLanguage();
       const tree =
         language === 'zh-CN' ? SUBCOMMAND_TREE_ZH : SUBCOMMAND_TREE_EN;

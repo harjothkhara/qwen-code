@@ -13,6 +13,7 @@ import {
 } from '@qwen-code/sdk/daemon';
 import { withActionTimeout } from '../timing.js';
 import type {
+  DaemonAutofixPrWatchList,
   DaemonDirectoryListing,
   DaemonFileStat,
   DaemonGoal,
@@ -76,21 +77,27 @@ export function createDaemonWorkspaceActions({
       );
     },
 
-    async listSessionGroups() {
+    async listSessionGroups(workspaceCwd) {
       const client = requireClient(getClient, 'List session groups failed');
-      const cwd = getWorkspaceCwd();
-      if (!cwd) return { groups: [], colorOptions: [] };
+      const currentCwd = getWorkspaceCwd();
+      const targetCwd = workspaceCwd ?? currentCwd;
+      if (!targetCwd) return { groups: [], colorOptions: [] };
       return withActionTimeout(
-        client.listSessionGroups(cwd),
+        workspaceCwd && workspaceCwd !== currentCwd
+          ? client.workspaceByCwd(workspaceCwd).listSessionGroups()
+          : client.listSessionGroups(targetCwd),
         'List session groups timed out',
       );
     },
 
-    async createSessionGroup(input) {
+    async createSessionGroup(input, workspaceCwd) {
       const client = requireClient(getClient, 'Create session group failed');
-      const cwd = requireWorkspaceCwd(getWorkspaceCwd);
+      const currentCwd = getWorkspaceCwd();
+      const targetCwd = workspaceCwd ?? requireWorkspaceCwd(getWorkspaceCwd);
       return withActionTimeout(
-        client.createSessionGroup(cwd, input),
+        workspaceCwd && workspaceCwd !== currentCwd
+          ? client.workspaceByCwd(workspaceCwd).createSessionGroup(input)
+          : client.createSessionGroup(targetCwd, input),
         'Create session group timed out',
       );
     },
@@ -543,6 +550,22 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    async loadExtensionSummaries() {
+      const client = requireClient(getClient, 'Load extensions failed');
+      return withActionTimeout(
+        client.workspaceExtensionSummaries(),
+        'Load extensions timed out',
+      );
+    },
+
+    async loadExtensionDetails(name) {
+      const client = requireClient(getClient, 'Load extension details failed');
+      return withActionTimeout(
+        client.workspaceExtensionDetails(name),
+        'Load extension details timed out',
+      );
+    },
+
     async loadToolsStatus() {
       const client = requireClient(getClient, 'Load tools failed');
       return withActionTimeout(client.workspaceTools(), 'Load tools timed out');
@@ -588,18 +611,18 @@ export function createDaemonWorkspaceActions({
       );
     },
 
-    async loadMemoryStatus() {
+    async loadMemoryStatus(options) {
       const client = requireClient(getClient, 'Load memory failed');
       return withActionTimeout(
-        client.workspaceMemory(),
+        client.workspaceMemory(options),
         'Load memory timed out',
       );
     },
 
-    async readWorkspaceFile(filePath) {
+    async readWorkspaceFile(filePath, opts) {
       const client = requireClient(getClient, 'Read workspace file failed');
       return withActionTimeout(
-        client.readWorkspaceFile(filePath),
+        client.readWorkspaceFile(filePath, opts),
         'Read workspace file timed out',
       );
     },
@@ -699,10 +722,13 @@ export function createDaemonWorkspaceActions({
       };
     },
 
-    async loadProviders() {
+    async loadProviders(workspaceCwd) {
       const client = requireClient(getClient, 'Load providers failed');
+      const cwd = getWorkspaceCwd();
       return withActionTimeout(
-        client.workspaceProviders(),
+        workspaceCwd && workspaceCwd !== cwd
+          ? client.workspaceByCwd(workspaceCwd).workspaceProviders()
+          : client.workspaceProviders(),
         'Load providers timed out',
       );
     },
@@ -862,6 +888,35 @@ export function createDaemonWorkspaceActions({
       if (!res.ok) {
         throw new Error(await readDaemonError(res, `DELETE ${path}`));
       }
+    },
+
+    // `/autofix-pr` watches: REST-only and read-only, routed like the
+    // scheduled tasks (primary unqualified, others by workspace id).
+    async listAutofixPrWatches(workspaceId) {
+      requireClient(getClient, 'List autofix-pr watches failed');
+      const path = workspaceId
+        ? `/workspaces/${encodeURIComponent(workspaceId)}/autofix-pr/watches`
+        : '/autofix-pr/watches';
+      const url = createDaemonRequestUrl(baseUrl, path);
+      const res = await withActionTimeout(
+        fetch(serializeDaemonRequestUrl(url, baseUrl), {
+          headers: createDaemonHeaders(token),
+        }),
+        'List autofix-pr watches timed out',
+      );
+      if (!res.ok) {
+        throw new Error(await readDaemonError(res, `GET ${path}`));
+      }
+      const data = (await res.json()) as Partial<DaemonAutofixPrWatchList>;
+      return {
+        available: data.available === true,
+        ...(typeof data.root === 'string' ? { root: data.root } : {}),
+        ...(typeof data.now === 'string' ? { now: data.now } : {}),
+        watches: Array.isArray(data.watches) ? data.watches : [],
+        ...(Array.isArray(data.unreadable)
+          ? { unreadable: data.unreadable }
+          : {}),
+      };
     },
 
     // Goals. `GET /goals` is REST-only (like /scheduled-tasks) and not on the
@@ -1140,6 +1195,39 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    async startGitWorkspaceClone(input) {
+      const client = requireClient(
+        getClient,
+        'Start git workspace clone failed',
+      );
+      return withActionTimeout(
+        client.startGitWorkspaceClone(input),
+        'Start git workspace clone timed out',
+      );
+    },
+
+    async getGitWorkspaceCloneJob(jobId) {
+      const client = requireClient(
+        getClient,
+        'Read git workspace clone failed',
+      );
+      return withActionTimeout(
+        client.getGitWorkspaceCloneJob(jobId),
+        'Read git workspace clone timed out',
+      );
+    },
+
+    async cancelGitWorkspaceClone(jobId) {
+      const client = requireClient(
+        getClient,
+        'Cancel git workspace clone failed',
+      );
+      return withActionTimeout(
+        client.cancelGitWorkspaceClone(jobId),
+        'Cancel git workspace clone timed out',
+      );
+    },
+
     async suggestWorkspacePaths(prefix) {
       const client = requireClient(getClient, 'Suggest workspace paths failed');
       const result = await withActionTimeout(
@@ -1157,6 +1245,36 @@ export function createDaemonWorkspaceActions({
         320_000,
       );
       return result as DaemonWorkspaceDirectoryPickerResult;
+    },
+
+    async listWorkspaceDirectories(workspaceSelector) {
+      const client = requireClient(
+        getClient,
+        'List workspace directories failed',
+      );
+      return withActionTimeout(
+        client.workspaceByCwd(workspaceSelector).directories(),
+        'List workspace directories timed out',
+      );
+    },
+
+    async addWorkspaceDirectory(workspaceSelector, path) {
+      const client = requireClient(getClient, 'Add workspace directory failed');
+      return withActionTimeout(
+        client.workspaceByCwd(workspaceSelector).addDirectory(path),
+        'Add workspace directory timed out',
+      );
+    },
+
+    async removeWorkspaceDirectory(workspaceSelector, path) {
+      const client = requireClient(
+        getClient,
+        'Remove workspace directory failed',
+      );
+      return withActionTimeout(
+        client.workspaceByCwd(workspaceSelector).removeDirectory(path),
+        'Remove workspace directory timed out',
+      );
     },
 
     async updateWorkspace(workspaceSelector, update) {

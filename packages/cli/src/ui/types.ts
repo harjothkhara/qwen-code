@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { RestoreToolResponseBinding } from './utils/restore-tool-response.js';
 import type {
   CompactionThresholds,
   CompressionStatus,
@@ -138,6 +139,51 @@ export interface CompressionProps {
   newTokenCountIsEstimated?: boolean;
 }
 
+/**
+ * Structured companion to the `/compress` sentences a command streams over ACP.
+ *
+ * The English sentence stays on the wire so text-only ACP hosts keep rendering
+ * something, but a host that owns its own UI language renders the outcome from
+ * this instead. Token counts travel as numbers (never preformatted) so the
+ * consumer picks its own grouping and estimated marker.
+ */
+export type ContextCompressionMeta =
+  | {
+      phase: 'progress';
+    }
+  | {
+      /**
+       * Terminal, like `done`: the fast path had nothing to strip. The session
+       * merges it into the progress block so the pending row is replaced in
+       * place, which is why it carries no counts.
+       */
+      phase: 'noop';
+    }
+  | {
+      phase: 'done';
+      originalTokenCount: number;
+      newTokenCount: number;
+      originalTokenCountIsEstimated?: boolean;
+      newTokenCountIsEstimated?: boolean;
+      /** Server-authored advisory; free-form text, not a translation key. */
+      warning?: string;
+    };
+
+/**
+ * A note about the invocation itself, emitted before the compression starts.
+ *
+ * It rides on its own `_meta` key rather than on `contextCompression`: the
+ * reducer folds a turn's text frames into one block and spreads `_meta` key by
+ * key, so a note sharing that key would be overwritten by the result frame that
+ * follows. A host that reads this key renders the note as its own row beside
+ * the compression it belongs to.
+ */
+export interface ContextCompressionNotice {
+  phase: 'notice';
+  /** Instruction budget the caller was clipped to. */
+  instructionsLimit: number;
+}
+
 export interface SummaryProps {
   isPending: boolean;
   stage: 'generating' | 'saving' | 'completed';
@@ -165,7 +211,10 @@ export interface HistoryItemBase {
 export type HistoryItemUser = HistoryItemBase & {
   type: 'user';
   text: string;
+  recallText?: string;
   promptId?: string;
+  /** Source-record link for conversation rewind, never for file restore. */
+  rewindId?: string;
   /**
    * Whether this UI history item represents a user turn that reached the model.
    *
@@ -197,11 +246,15 @@ export type HistoryItemLlmThought = HistoryItemBase & {
   type: 'gemini_thought';
   text: string;
   durationMs?: number;
+  isStreaming?: boolean;
+  thoughtGroupId?: number;
 };
 
 export type HistoryItemLlmThoughtContent = HistoryItemBase & {
   type: 'gemini_thought_content';
   text: string;
+  isStreaming?: boolean;
+  thoughtGroupId?: number;
 };
 
 export type HistoryItemInfo = HistoryItemBase & {
@@ -398,6 +451,9 @@ export interface ToolDefinition {
   name: string;
   displayName: string;
   description?: string;
+  /** Omni media-policy tool that only runs via fixed policies: it is hidden
+   * from the model's declarations, so /tools annotates it for the human. */
+  fixedOnly?: boolean;
   /**
    * Registered, but its schema is not in the eager model request — the tool
    * is reached on demand via `tool_search`. Set for `shouldDefer` tools and
@@ -476,8 +532,22 @@ export interface ContextCategoryBreakdown {
   builtinTools: number;
   mcpTools: number;
   memoryFiles: number;
+  /** Skill tool definition + the `<available_skills>` listing as sent + loaded bodies. */
   skills: number;
+  /** Startup prelude outside the skill listing: environment context, MCP server instructions, deferred-tools reminder. */
+  startupContext?: number;
+  /**
+   * Content estimate of the conversation after the startup prelude. With no
+   * provider total (`totalTokens` 0, e.g. after `/model`, `/restore` or a
+   * resume) it is nonzero, and it is only *part* of the local estimate that
+   * drives the tier: the tier then keys on the request overhead plus this
+   * value, not on this value or on `totalTokens` alone.
+   */
   messages: number;
+  /** Provider total not accounted for by any category estimate. Categories plus this sum to `totalTokens`. */
+  unattributed?: number;
+  /** Provider-reported cached prefix. An annotation, not a category: the cached prefix spans several categories. */
+  cachedTokens?: number;
   freeSpace: number;
   /**
    * Distance from the auto-compaction threshold to the window edge.
@@ -507,7 +577,7 @@ export interface ContextMemoryDetail {
 
 export interface ContextSkillDetail {
   name: string;
-  /** Token cost of the skill listing (name+description) in the tool definition */
+  /** Token cost of this skill's entry in the `<available_skills>` listing as sent (after budget trimming) */
   tokens: number;
   /** Whether this skill has been invoked and its full body loaded into context */
   loaded?: boolean;
@@ -934,6 +1004,7 @@ export type SlashCommandProcessorResult =
       type: 'schedule_tool';
       toolName: string;
       toolArgs: Record<string, unknown>;
+      restoreResponseBinding?: RestoreToolResponseBinding;
     }
   | {
       type: 'handled'; // Indicates the command was processed and no further action is needed.
@@ -949,11 +1020,14 @@ export interface ShellConfirmationRequest {
 }
 
 export interface ConfirmationRequest {
+  signal?: AbortSignal;
+  isCurrent?: () => boolean;
   prompt: ReactNode;
   onConfirm: (confirm: boolean) => void;
 }
 
 export interface LoopDetectionConfirmationRequest {
+  cause?: string;
   onComplete: (result: { userSelection: 'disable' | 'keep' }) => void;
 }
 
