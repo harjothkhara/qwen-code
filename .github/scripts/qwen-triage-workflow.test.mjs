@@ -33,7 +33,7 @@ const cacheProducerPath = join(
   dirname(fileURLToPath(import.meta.url)),
   '..',
   'workflows',
-  'npm-cache.yml',
+  'pnpm-store.yml',
 );
 const cacheProducerDoc = parse(readFileSync(cacheProducerPath, 'utf8'));
 const prWorkflowPath = join(
@@ -54,6 +54,39 @@ const cleanStep = steps.find((s) => s.name === 'Clean stale agent state');
 const triageOwnershipStep = steps.find(
   (s) => s.name === 'Restore workspace ownership',
 );
+const triageContextStep = steps.find((s) => s.name === 'Prepare agent context');
+const publishTriageJob = doc.jobs['publish-triage'];
+const publisherPath = join(
+  dirname(fileURLToPath(import.meta.url)),
+  'triage-publish.mjs',
+);
+// The triage agent is a direct CLI launch now; its settings travel as the
+// heredoc the host writes into the fresh per-run QWEN_HOME. Extract and parse
+// them the same way the runtime will read them.
+const readTriageSettings = () => {
+  assert.ok(
+    triageContextStep,
+    'triage must keep the Prepare agent context step',
+  );
+  const m = triageContextStep.run.match(
+    /cat > "\$QWEN_HOME\/settings\.json" <<'SETTINGS_JSON'\n([\s\S]*?)\n\s*SETTINGS_JSON/,
+  );
+  assert.ok(
+    m,
+    'the context step must write settings.json through the SETTINGS_JSON heredoc',
+  );
+  const settings = JSON.parse(m[1]);
+  // v1 top-level keys only work through runtime migration; write the native
+  // v2 shape (the qwen-triage.yml convention).
+  for (const key of ['coreTools', 'maxSessionTurns', 'sandbox']) {
+    assert.equal(
+      settings[key],
+      undefined,
+      `v1 top-level \`${key}\` is a legacy key — use the v2 shape`,
+    );
+  }
+  return settings;
+};
 const verifyJob = doc.jobs.verify;
 const verifyOwnershipStep = verifyJob.steps.find(
   (s) => s.name === 'Restore workspace ownership',
@@ -187,12 +220,22 @@ const assertSettingsContract = (step, label) => {
 };
 
 describe('qwen-triage: agent tool/permission settings', () => {
-  it('passes `settings:` (not the silently-dropped `settings_json:`)', () => {
-    assertSettingsContract(triageStep, 'triage step (id: triage)');
+  it('writes settings host-side; the agent is a direct launch, not an action', () => {
+    // The settings_json bug class (an unknown action input silently dropped)
+    // is gone with the action: the host writes the settings file itself and
+    // the launch is a plain CLI invocation whose env we fully control.
+    readTriageSettings();
+    assert.equal(
+      triageStep.uses,
+      undefined,
+      'the triage agent must be a direct CLI launch, not qwen-code-action',
+    );
+    assert.match(triageStep.run, /runuser -u node -- env -i/);
+    assert.doesNotMatch(JSON.stringify(triageJob), /settings_json/);
   });
 
   it('settings is valid JSON that restricts the toolset', () => {
-    const settings = assertSettingsContract(triageStep, 'triage settings');
+    const settings = readTriageSettings();
     const core = settings.tools?.core;
     assert.ok(
       Array.isArray(core),
@@ -221,7 +264,7 @@ describe('qwen-triage: agent tool/permission settings', () => {
   });
 
   it('settings denies interpreters, network, and PR-code-materializing git/gh', () => {
-    const settings = assertSettingsContract(triageStep, 'triage settings');
+    const settings = readTriageSettings();
     const deny = settings.permissions?.deny ?? [];
     for (const d of [
       'run_shell_command(node)',
@@ -234,8 +277,7 @@ describe('qwen-triage: agent tool/permission settings', () => {
     ]) {
       assert.ok(deny.includes(d), `permissions.deny must include ${d}`);
     }
-    // No sandbox key: the ECS pool ships no container runtime, and adding one
-    // would silently disable the step.
+    // No sandbox key: the job itself is the container now.
     assert.equal(
       settings.sandbox,
       undefined,
@@ -698,23 +740,24 @@ describe('qwen-issue-followup-bot.yml: agent settings', () => {
   });
 });
 
-describe('qwen-triage: fork-PR runner routing', () => {
+describe('qwen-triage: runner routing under token isolation', () => {
   const runsOn = String(triageJob['runs-on']);
   const authorizeJob = doc.jobs.authorize;
   const authorizeRunsOn = String(authorizeJob['runs-on']);
 
-  it('routes the ECS pool on same-repo or a REAL write-permission check', () => {
-    assert.match(runsOn, /head\.repo\.full_name == github\.repository/);
-    // The boundary is the collaborator-permission lookup authorize computes,
-    // NOT the coarse author_association: MEMBER admits any org member and
-    // COLLABORATOR admits read-only invitees — neither implies write access
-    // on this repo, and this job's agent loads bot PATs and a model key.
-    assert.match(
-      runsOn,
-      /needs\.authorize\.outputs\.author_can_write == 'true'/,
-    );
-    assert.doesNotMatch(runsOn, /author_association/);
+  it('routes every trigger to ECS behind the repo guard and kill-switch', () => {
+    // With the write PAT out of the agent environment (read-only token +
+    // drafts executed by publish-triage + container), routing no longer
+    // depends on the target PR's author or on the event shape: the controls
+    // carry the trust boundary, not the machine choice. Hosted capacity is
+    // the scarce side; the pool is maintainer-provided and expandable.
+    assert.match(runsOn, /github\.repository == 'QwenLM\/qwen-code'/);
+    assert.match(runsOn, /vars\.MAINTAINER_ECS_RUNNER_DISABLED != 'true'/);
     assert.match(runsOn, /ecs-qwen/);
+    assert.doesNotMatch(runsOn, /author_can_write/);
+    assert.doesNotMatch(runsOn, /author_association/);
+    assert.doesNotMatch(runsOn, /head\.repo/);
+    assert.doesNotMatch(runsOn, /event_name/);
   });
 
   it('keeps the authorize gate itself on the same-repo guard', () => {
@@ -728,30 +771,164 @@ describe('qwen-triage: fork-PR runner routing', () => {
     assert.doesNotMatch(authorizeRunsOn, /needs\./);
   });
 
-  it('computes author_can_write from the collaborator-permission API', () => {
-    assert.equal(
-      authorizeJob.outputs.author_can_write,
-      '${{ steps.perm.outputs.author_can_write }}',
-    );
+  it('retires author_can_write (its only consumer was triage routing)', () => {
+    assert.equal(authorizeJob.outputs.author_can_write, undefined);
     const perm = authorizeJob.steps.find((s) => s.id === 'perm');
-    assert.ok(
-      String(perm.env.PR_AUTHOR).includes(
-        'github.event.pull_request.user.login',
-      ),
-    );
-    assert.match(perm.run, /collaborators\/\$\{PR_AUTHOR\}\/permission/);
-    assert.match(
-      perm.run,
-      /admin\|maintain\|write\) echo "author_can_write=true"/,
-    );
+    assert.doesNotMatch(perm.run, /author_can_write/);
+    assert.equal(perm.env.PR_AUTHOR, undefined);
   });
 
   it('falls back to an ephemeral hosted runner', () => {
     assert.match(runsOn, /ubuntu-latest/);
   });
+});
 
-  it('keeps issue triage on ECS (issues carry no foreign code)', () => {
-    assert.match(runsOn, /github\.event_name == 'issues'/);
+describe('qwen-triage: token isolation contract', () => {
+  it('gives the triage job read-only permissions only', () => {
+    const perms = triageJob.permissions;
+    assert.ok(perms, 'triage must declare explicit job-level permissions');
+    for (const [scope, level] of Object.entries(perms)) {
+      assert.equal(level, 'read', `triage permission ${scope} must be read`);
+    }
+    for (const scope of [
+      'contents',
+      'issues',
+      'pull-requests',
+      'checks',
+      'actions',
+    ]) {
+      assert.equal(
+        perms[scope],
+        'read',
+        `triage needs ${scope}:read for the agent's API reads`,
+      );
+    }
+  });
+
+  it('runs the agent in a container with no write credential in its env', () => {
+    assert.equal(triageJob.container?.image, 'node:22-bookworm');
+    // runuser comes from util-linux; the tmux/verify lanes install it
+    // explicitly before launching the agent as node. Pin the install line,
+    // not a prose mention.
+    const tools = steps.find((s) => s.name === 'Install triage tools');
+    assert.ok(tools, 'the container toolchain step must exist');
+    assert.match(tools.run, /apt-get install[^\n]*util-linux/);
+    const env = triageStep.env ?? {};
+    // The agent's GitHub credential is the job's read-only GITHUB_TOKEN.
+    assert.equal(env.GH_TOKEN, '${{ secrets.GITHUB_TOKEN }}');
+    assert.ok(!JSON.stringify(env).includes('CI_BOT_PAT'));
+    assert.ok(!JSON.stringify(env).includes('QWEN_CODE_BOT_TOKEN'));
+    const run = triageStep.run;
+    assert.match(run, /runuser -u node -- env -i/);
+    // The gh/git proxy wrappers must be traversable by the agent user, or
+    // they silently fall out of PATH on a proxied runner.
+    assert.match(run, /chmod 755 "\$proxy_bin"/);
+    assert.match(run, /"GITHUB_TOKEN=\$GH_TOKEN"/);
+    assert.match(run, /"GH_TOKEN=\$GH_TOKEN"/);
+    assert.match(run, /"QWEN_TRIAGE_PUBLISH=workflow"/);
+    // The real model key stays behind the loopback proxy.
+    assert.match(run, /"OPENAI_API_KEY=\$PROXY_TOKEN"/);
+    const envBlock = run.slice(
+      run.indexOf('QWEN_ENV=('),
+      run.indexOf('timeout --kill-after'),
+    );
+    assert.ok(envBlock.length > 0, 'the env -i list must exist');
+    assert.ok(!envBlock.includes('secrets.'));
+  });
+
+  it('uploads drafts on every outcome with the non-regular-file strip', () => {
+    const sanitize = steps.find((s) => s.name === 'Sanitize triage drafts');
+    const upload = steps.find((s) => s.name === 'Upload triage drafts');
+    assert.ok(sanitize, 'drafts must be sanitized before upload');
+    assert.ok(upload, 'drafts must upload for the publisher');
+    assert.equal(sanitize.if, 'always()');
+    assert.match(sanitize.run, /-type l/);
+    // A detached agent child could re-plant symlinks between the strip and
+    // the upload (which FOLLOWS them), so lingering agent-user processes
+    // must be killed BEFORE the strip — and zombies must not count, or the
+    // check never clears (tmux/verify rule).
+    const killAt = sanitize.run.indexOf('pkill -KILL -u node');
+    const stripAt = sanitize.run.indexOf('-type l');
+    assert.ok(killAt !== -1, 'sanitize must kill lingering agent processes');
+    assert.ok(
+      killAt < stripAt,
+      'the process kill must precede the symlink strip',
+    );
+    assert.match(sanitize.run, /\$2 !~ \/\^Z\//);
+    assert.equal(upload.if, 'always()');
+    assert.match(String(upload.with.name), /triage-drafts-/);
+  });
+
+  it('keeps the drafts artifact addressable when resolve never ran', () => {
+    // Upload and download must agree on the name even when the run died
+    // before 'Resolve target number': the job output mirrors the upload's
+    // primary segment, and both sides share the same event-number fallback.
+    const upload = steps.find((s) => s.name === 'Upload triage drafts');
+    const download = publishTriageJob.steps.find(
+      (s) => s.name === 'Download triage drafts',
+    );
+    assert.ok(download, 'the publisher must download the drafts artifact');
+    assert.equal(
+      triageJob.outputs.pr_number,
+      '${{ steps.resolve.outputs.number }}',
+    );
+    const fallback = '|| github.event.issue.number';
+    assert.ok(String(upload.with.name).includes(fallback));
+    assert.ok(String(download.with.name).includes(fallback));
+  });
+
+  it('publishes drafts from a separate job that never runs agent code', () => {
+    assert.ok(publishTriageJob, 'publish-triage job must exist');
+    assert.deepEqual(publishTriageJob.needs, ['triage']);
+    assert.match(String(publishTriageJob.if), /always\(\)/);
+    assert.match(
+      String(publishTriageJob.if),
+      /needs\.triage\.result != 'skipped'/,
+    );
+    // Per-RUN group (publish-tmux rule): a per-PR group would let a second
+    // run replace a completed run's pending publisher and drop its drafts.
+    assert.match(
+      String(publishTriageJob.concurrency.group),
+      /publish-triage-\{1\}/,
+    );
+    assert.match(String(publishTriageJob.concurrency.group), /github\.run_id/);
+    assert.equal(publishTriageJob.concurrency['cancel-in-progress'], false);
+    assert.ok(publishTriageJob['timeout-minutes'] <= 30);
+    const checkout = publishTriageJob.steps.find((s) =>
+      /^Checkout/.test(s.name),
+    );
+    assert.ok(checkout, 'publisher must sparse-checkout its scripts');
+    assert.match(
+      String(checkout.with['sparse-checkout']),
+      /triage-publish\.mjs/,
+    );
+    assert.equal(checkout.with['persist-credentials'], false);
+    assert.equal(checkout.with.ref, '${{ github.sha }}');
+    const publish = publishTriageJob.steps.find(
+      (s) => s.name === 'Publish triage drafts',
+    );
+    assert.ok(publish, 'publisher must run the draft script');
+    assert.match(publish.run, /triage-publish\.mjs/);
+    assert.ok(String(publish.env.GH_TOKEN).includes('CI_BOT_PAT'));
+  });
+
+  it('inspects published reviews only after publishing (notify moved)', () => {
+    // The notify step reads the reviews THIS run posted; under token
+    // isolation those land in the publish step, so notify must follow it in
+    // the publish job — left in the agent job it would always see none.
+    const notify = publishTriageJob.steps.find(
+      (s) => s.name === 'Notify silent triage re-run',
+    );
+    assert.ok(notify, 'notify must live in publish-triage');
+    const notifyIdx = publishTriageJob.steps.indexOf(notify);
+    const publishIdx = publishTriageJob.steps.findIndex(
+      (s) => s.name === 'Publish triage drafts',
+    );
+    assert.ok(publishIdx !== -1 && notifyIdx > publishIdx);
+    assert.ok(
+      !steps.some((s) => s.name === 'Notify silent triage re-run'),
+      'notify must not remain in the agent job',
+    );
   });
 });
 
@@ -1074,30 +1251,32 @@ describe('ci.yml: self-hosted checkout jobs restore ownership unconditionally', 
   });
 });
 
-describe('qwen-triage: maintainer resolver heredoc vs the backtick deny rule', () => {
-  it('keeps the resolver bash block backtick-free so the deny rule never fires', () => {
-    // The triage lane's permissions.deny includes run_shell_command(*`*):
-    // any command text containing a backtick is EXECUTION_DENIED before
-    // approval. A template literal (or a backticked comment) inside the
-    // resolver heredoc would therefore kill the whole command, and
-    // deferrals would silently lose their deterministic assignee.
-    const settings = assertSettingsContract(triageStep, 'triage settings');
+describe('qwen-triage: maintainer resolver lives in the publisher', () => {
+  it('keeps the backtick deny rule; the skill drafts defer instead of resolving', () => {
+    // The resolver's collaborator-permission lookup needs a write-level
+    // token, which the read-only CI agent no longer holds, so the resolver
+    // moved into triage-publish.mjs. The skill must not grow a replacement
+    // heredoc (which would also re-expose the backtick deny-rule hazard the
+    // old block had to dance around).
+    const settings = readTriageSettings();
     const deny = settings.permissions?.deny ?? [];
     assert.ok(
       deny.includes('run_shell_command(*`*)'),
       'permissions.deny must keep the backtick rule',
     );
-    const blocks = [...prSkill.matchAll(/```bash\n([\s\S]*?)\n```/g)].map(
-      (m) => m[1],
-    );
-    const resolver = blocks.find(
-      (b) => b.includes("<<'EOF'") && b.includes('collaborators'),
-    );
-    assert.ok(resolver, 'maintainer resolver heredoc block must exist');
     assert.ok(
-      !resolver.includes('`'),
-      'resolver block must contain no backtick, or the deny rule blocks it',
+      !prSkill.includes('collaborators/'),
+      'the skill must not call the collaborator-permission API',
     );
+    assert.ok(
+      !prSkill.includes('assign-issue-owner.mjs'),
+      'the resolver import must live in the publisher, not the skill',
+    );
+    assert.match(prSkill, /\{action:"defer"/);
+    const publisher = readFileSync(publisherPath, 'utf8');
+    assert.match(publisher, /collaborators/);
+    assert.match(publisher, /pickOwner/);
+    assert.match(publisher, /QWEN_MAINTAINER_HANDLE/);
   });
 });
 
@@ -1139,16 +1318,19 @@ describe('qwen-triage: Stage 1e revert-pattern signals', () => {
   });
 });
 
-describe('qwen-triage: npm cache restore-only invariant', () => {
+describe('qwen-triage: pnpm store restore-only invariant', () => {
   for (const [jobName, jobDef] of [
     ['verify', verifyJob],
     ['tmux-testing', tmuxJob],
   ]) {
     it(`${jobName}: uses actions/cache/restore with no save path`, () => {
       const cacheStep = jobDef.steps.find(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
-      assert.ok(cacheStep, `'Restore npm cache' step must exist in ${jobName}`);
+      assert.ok(
+        cacheStep,
+        `'Restore pnpm store' step must exist in ${jobName}`,
+      );
       assert.match(
         cacheStep.uses,
         /^actions\/cache\/restore@/,
@@ -1165,9 +1347,9 @@ describe('qwen-triage: npm cache restore-only invariant', () => {
       }
     });
 
-    it(`${jobName}: npm ci --cache matches the restored directory`, () => {
+    it(`${jobName}: pnpm install --store-dir matches the restored directory`, () => {
       const cacheStep = jobDef.steps.find(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
       const prepareStep = jobDef.steps.find(
         (s) => s.name === 'Install and build PR app',
@@ -1182,25 +1364,25 @@ describe('qwen-triage: npm cache restore-only invariant', () => {
       );
       assert.ok(dir, 'cache path must resolve to a directory name');
       assert.ok(
-        prepareStep.run.includes(`--cache "$RUNNER_TEMP/${dir}"`),
-        `npm ci must use --cache "$RUNNER_TEMP/${dir}"`,
+        prepareStep.run.includes(`--store-dir "$RUNNER_TEMP/${dir}"`),
+        `pnpm install must use --store-dir "$RUNNER_TEMP/${dir}"`,
       );
     });
 
-    it(`${jobName}: clears stale npm cache before restore`, () => {
+    it(`${jobName}: clears stale pnpm store before restore`, () => {
       const clearIdx = jobDef.steps.findIndex(
-        (s) => s.name === 'Clear stale npm cache',
+        (s) => s.name === 'Clear stale pnpm store',
       );
       const restoreIdx = jobDef.steps.findIndex(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
       assert.ok(
         clearIdx !== -1,
-        `'Clear stale npm cache' step must exist in ${jobName}`,
+        `'Clear stale pnpm store' step must exist in ${jobName}`,
       );
       assert.ok(
         restoreIdx !== -1,
-        `'Restore npm cache' step must exist in ${jobName}`,
+        `'Restore pnpm store' step must exist in ${jobName}`,
       );
       assert.ok(
         clearIdx < restoreIdx,
@@ -1212,7 +1394,7 @@ describe('qwen-triage: npm cache restore-only invariant', () => {
         'clear step must rm -rf the cache directory',
       );
       const cacheStep = jobDef.steps.find(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
       const dir = cacheStep.with.path.replace(
         /^\$\{\{\s*runner\.temp\s*\}\}\//,
@@ -1226,34 +1408,34 @@ describe('qwen-triage: npm cache restore-only invariant', () => {
 
     it(`${jobName}: reports the cache hit so a permanent miss is visible`, () => {
       const cacheStep = jobDef.steps.find(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
       assert.equal(
         cacheStep.id,
-        'npm-cache',
+        'pnpm-store',
         'restore step needs an id so its cache-hit output is readable',
       );
       const reportStep = jobDef.steps.find(
-        (s) => s.name === 'Report npm cache hit',
+        (s) => s.name === 'Report pnpm store hit',
       );
-      assert.ok(reportStep, "'Report npm cache hit' step must exist");
+      assert.ok(reportStep, "'Report pnpm store hit' step must exist");
       assert.match(
         reportStep.run,
-        /steps\.npm-cache\.outputs\.cache-hit/,
+        /steps\.pnpm-store\.outputs\.cache-hit/,
         'report step must surface the cache-hit output',
       );
     });
   }
 });
 
-describe('qwen-triage: npm cache producer workflow', () => {
+describe('qwen-triage: pnpm store producer workflow', () => {
   const saveJob = cacheProducerDoc.jobs.save;
 
   it('triggers on push to main only', () => {
     const push = cacheProducerDoc.on.push ?? cacheProducerDoc[true]?.push;
     assert.ok(push, 'must have a push trigger');
     assert.deepEqual(push.branches, ['main']);
-    assert.deepEqual(push.paths, ['package-lock.json']);
+    assert.deepEqual(push.paths, ['pnpm-lock.yaml']);
   });
 
   it('saves with the same key and path the triage lanes restore', () => {
@@ -1266,7 +1448,7 @@ describe('qwen-triage: npm cache producer workflow', () => {
       ['tmux-testing', tmuxJob],
     ]) {
       const restoreStep = jobDef.steps.find(
-        (s) => s.name === 'Restore npm cache',
+        (s) => s.name === 'Restore pnpm store',
       );
       assert.equal(
         saveStep.with.path,
@@ -1292,12 +1474,12 @@ describe('qwen-triage: npm cache producer workflow', () => {
     );
     assert.ok(dir, 'save path must resolve to a directory name');
     const populateStep = saveJob.steps.find(
-      (s) => s.name === 'Populate npm cache',
+      (s) => s.name === 'Populate pnpm store',
     );
-    assert.ok(populateStep, "'Populate npm cache' step must exist");
+    assert.ok(populateStep, "'Populate pnpm store' step must exist");
     assert.ok(
-      populateStep.run.includes(`--cache "$RUNNER_TEMP/${dir}"`),
-      `populate step must fill the saved cache directory (--cache "$RUNNER_TEMP/${dir}")`,
+      populateStep.run.includes(`--store-dir "$RUNNER_TEMP/${dir}"`),
+      `populate step must fill the saved store directory (--store-dir "$RUNNER_TEMP/${dir}")`,
     );
   });
 
@@ -2702,11 +2884,12 @@ describe('qwen-triage: flakiness gate (#9125)', () => {
     // agent 120m + install/build 15m + gate ~40m (the 15m round budget is
     // checked BEFORE each reset, so the last invocation drags its reset
     // plus its -k 30 600 cap; add the OID pin and the post-gate reset)
-    // + misc ~5m ≈ 180m — the job limit must stay comfortably above the
-    // sum or the container is killed mid-run and the ship-what-ran path
-    // is bypassed (see the budget comment).
+    // + misc ~5m + java toolchain/repo/modules ≤ ~20m (Java diffs only,
+    // each download and mvn install capped) ≈ 200m — the job limit must
+    // stay comfortably above the sum or the container is killed mid-run
+    // and the ship-what-ran path is bypassed (see the budget comment).
     assert.ok(
-      verifyJob['timeout-minutes'] >= 190,
+      verifyJob['timeout-minutes'] >= 210,
       `timeout-minutes must cover the gate budget (got ${verifyJob['timeout-minutes']})`,
     );
   });
